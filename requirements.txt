@@ -1,0 +1,7 @@
+git+http://github.com/pytorch/vision.git
+git+http://github.com/pytorch/tnt.git
+imageio
+tqdm
+ptable
+pyyaml
+slackclient
