@@ -3,6 +3,8 @@ from pathlib import Path
 
 import imageio
 import pandas as pd
+from tqdm import tqdm
+from PIL import Image
 
 import torch
 from torch.utils.data import Dataset, Subset
@@ -11,7 +13,8 @@ from torchvision import transforms
 from utils import logger
 
 #STANFORD_CXR_BASE = Path("/mnt/hdd/cxr/Stanford/full_resolution_version").resolve()
-STANFORD_CXR_BASE = Path("/mnt/hdd/cxr/Stanford/downsampled_version").resolve()
+STANFORD_CXR_BASE = Path("/mnt/hdd/cxr/stanford/v1").resolve()
+MIMIC_CXR_BASE = Path("/mnt/hdd/cxr/mimic/v1").resolve()
 
 MODES = ["per_image", "per_study"]
 
@@ -31,15 +34,18 @@ def _group_study(images):
             assert cur_entry[1] == l
         else:
             num_images_per_entry.append(len(cur_entry[0]))
+            #if len(cur_entry[0]) > 3:
+            #    print(f"{study} has {len(cur_entry[0])} images.. only 3 images are used.")
+            #    cur_entry = (cur_entry[0][:3], cur_entry[1])
             entries.append(cur_entry)
             cur_entry = ([f], l)
         prev_study = study
 
-    assert max(num_images_per_entry) <= 3
+    logger.debug(f"max images per study: {max(num_images_per_entry)}")
     return entries
 
 
-def _load_manifest(file_path, mode="per_image"):
+def _load_manifest(base_path, file_path, mode="per_study"):
     assert mode in MODES
     if not file_path.exists():
         logger.error(f"manifest file {file_path} not found.")
@@ -48,10 +54,10 @@ def _load_manifest(file_path, mode="per_image"):
     logger.debug(f"loading dataset manifest {file_path} ...")
     df = pd.read_csv(str(file_path)).fillna(0)
     #df = df.loc[df['AP/PA'] == 'PA']
-    LABELS = df.columns.values.tolist()[5:]
+    LABELS = df.columns.values.tolist()[-14:]
     paths = df.iloc[:, 0].tolist()
-    labels = df.replace(-1, 0).iloc[:, 5:].values.tolist()
-    images = [(STANFORD_CXR_BASE.joinpath(p), l) for p, l in zip(paths, labels)]
+    labels = df.replace(-1, 0).iloc[:, -14:].values.tolist()
+    images = [(base_path.joinpath(p), l) for p, l in zip(paths, labels)]
 
     if mode == "per_image":
         entries = images
@@ -66,6 +72,7 @@ def _load_manifest(file_path, mode="per_image"):
 
 cxr_transforms = transforms.Compose([
     transforms.ToPILImage(),
+    transforms.Resize(300, Image.LANCZOS),
     transforms.RandomRotation((-10, 10)),
     transforms.RandomCrop((256, 256)),
     transforms.RandomHorizontalFlip(),
@@ -82,20 +89,21 @@ def get_image(img_path):
 
 
 def get_study(img_paths):
-    image_tensor = torch.zeros(3, 256, 256)
+    max_imgs = 20
+    image_tensor = torch.zeros(max_imgs, 256, 256)
     for i, img_path in enumerate(img_paths):
         image = imageio.imread(img_path)
         image_tensor[i, :, :] = cxr_transforms(image)
-    image_tensor = image_tensor[torch.randperm(3), :, :]
+    image_tensor = image_tensor[torch.randperm(max_imgs), :, :]
     return image_tensor
 
 
 class StanfordDataset(Dataset):
 
-    def __init__(self, manifest_file, mode="per_image", *args, **kwargs):
+    def __init__(self, base_path, manifest_file, mode="per_study", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.manifest_file = STANFORD_CXR_BASE.joinpath(manifest_file).resolve()
-        self.entries, self.labels = _load_manifest(self.manifest_file, mode)
+        manifest_path = base_path.joinpath(manifest_file).resolve()
+        self.entries, self.labels = _load_manifest(base_path, manifest_path, mode)
         self.mode = mode
 
     def __getitem__(self, index):
@@ -109,16 +117,13 @@ class StanfordDataset(Dataset):
             target_tensor = torch.FloatTensor(label)
         else:
             raise RuntimeError
-
         return image_tensor, target_tensor
 
     def __len__(self):
         return len(self.entries)
 
 
-def copy_stanford_dataset(src_path, tar_path):
-    from tqdm import tqdm
-    from PIL import Image
+def copy_stanford_dataset(src_path):
     for m in [src_path.joinpath("train.csv"), src_path.joinpath("valid.csv")]:
         print(f">>> processing {m}...")
         df = pd.read_csv(str(m))
@@ -130,19 +135,17 @@ def copy_stanford_dataset(src_path, tar_path):
             rs = (512, int(h/w*512)) if w < h else (int(w/h*512), 512)
             resized = img.resize(rs, Image.LANCZOS)
             r = ff.relative_to(src_path)
-            t = tar_path.joinpath(r).resolve()
+            t = STANFORD_CXR_BASE.joinpath(r).resolve()
             #print(f"{ff} -> {t}")
             Path.mkdir(t.parent, parents=True, exist_ok=True)
             resized.save(t, "JPEG")
             df.at[i, "Path"] = f
         r = m.relative_to(src_path).name
-        t = tar_path.joinpath(r).resolve()
+        t = STANFORD_CXR_BASE.joinpath(r).resolve()
         df.to_csv(t, float_format="%.0f", index=False)
 
 
-def copy_mimic_dataset(src_path, tar_path):
-    from tqdm import tqdm
-    from PIL import Image
+def copy_mimic_dataset(src_path):
     for m in [src_path.joinpath("train.csv"), src_path.joinpath("valid.csv")]:
         print(f">>> processing {m}...")
         df = pd.read_csv(str(m))
@@ -154,12 +157,12 @@ def copy_mimic_dataset(src_path, tar_path):
             rs = (512, int(h/w*512)) if w < h else (int(w/h*512), 512)
             resized = img.resize(rs, Image.LANCZOS)
             r = ff.relative_to(src_path)
-            t = tar_path.joinpath(r).resolve()
+            t = MIMIC_CXR_BASE.joinpath(r).resolve()
             #print(f"{ff} -> {t}")
             Path.mkdir(t.parent, parents=True, exist_ok=True)
             resized.save(t, "JPEG")
         r = m.relative_to(src_path).name
-        t = tar_path.joinpath(r).resolve()
+        t = MIMIC_CXR_BASE.joinpath(r).resolve()
         df.to_csv(t, float_format="%.0f", index=False)
 
 
@@ -173,10 +176,8 @@ if __name__ == "__main__":
     """
     # resize & copy stanford dataset
     src_path = Path("/media/nfs/CXR/Stanford/full_resolution_version/CheXpert-v1.0").resolve()
-    tar_path = Path("/mnt/hdd/cxr/stanford/v1").resolve()
-    copy_stanford_dataset(src_path, tar_path)
+    copy_stanford_dataset(src_path)
 
     # resize & copy mimic dataset
     src_path = Path("/media/mycloud/MIMIC_CXR").resolve()
-    tar_path = Path("/mnt/hdd/cxr/mimic/v1").resolve()
-    copy_mimic_dataset(src_path, tar_path)
+    copy_mimic_dataset(src_path)

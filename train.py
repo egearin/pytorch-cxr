@@ -16,7 +16,7 @@ import torchvision
 import torchnet as tnt
 
 from predict import Modelset, Predictor
-from dataset import StanfordDataset
+from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
 from model import Network
 from utils import logger, set_log_to_file, set_log_to_slack, print_versions
 from adamw import AdamW
@@ -30,10 +30,14 @@ class TrainModelset(Modelset):
     """
 
     def __init__(self, device="cpu", model_file=None):
-        train_set = StanfordDataset("CheXpert-v1.0-small/train.csv", mode="per_study")
-        test_set = StanfordDataset("CheXpert-v1.0-small/valid.csv", mode="per_study")
-        concat_set = ConcatDataset([train_set, test_set])
-        datasets = random_split(concat_set, [len(concat_set) - 10000, 10000])
+        stanford_train_set = StanfordDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
+        stanford_test_set = StanfordDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
+        mimic_train_set = StanfordDataset(MIMIC_CXR_BASE, "train.csv", mode="per_study")
+        mimic_test_set = StanfordDataset(MIMIC_CXR_BASE, "valid.csv", mode="per_study")
+        concat_set = ConcatDataset([stanford_train_set, stanford_test_set, mimic_train_set, mimic_test_set])
+
+        num_test = 20000
+        datasets = random_split(concat_set, [len(concat_set) - num_test, num_test])
         #subset = Subset(concat_set, range(0, 36))
         #datasets = random_split(subset, [len(subset) - 12, 12])
 
@@ -42,14 +46,16 @@ class TrainModelset(Modelset):
         logger.info(f"using {len(datasets[0])}/{len(concat_set)} ({train_set_percent:.1f}%) entries for training dataset")
         logger.info(f"using {len(datasets[1])}/{len(concat_set)} ({test_set_percent:.1f}%) entries for testing dataset")
 
-        self.train_loader = DataLoader(datasets[0], batch_size=32, num_workers=32, shuffle=True, pin_memory=True)
-        self.test_loader = DataLoader(datasets[1], batch_size=32, num_workers=32, shuffle=False, pin_memory=True)
+        self.train_loader = DataLoader(datasets[0], batch_size=16, num_workers=16, shuffle=True, pin_memory=True)
+        self.test_loader = DataLoader(datasets[1], batch_size=16, num_workers=16, shuffle=False, pin_memory=True)
 
-        self.out_dim = len(train_set.labels)
-        self.labels = train_set.labels
+        self.out_dim = len(stanford_train_set.labels)
+        self.labels = stanford_train_set.labels
 
-        #img, tar = train_set[0]
+        #img, tar = datasets[0]
         #plt.imshow(img.squeeze(), cmap='gray')
+
+        # self.model will be loaded in super().__init__()
         super().__init__(out_dim=self.out_dim, device=device, model_file=model_file)
 
         self.optimizer = AdamW(self.model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
