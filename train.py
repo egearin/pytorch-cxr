@@ -180,7 +180,9 @@ class Trainer:
             p.field_names = ["findings", "score"]
             for i in range(out_dim):
                 p.add_row([labels[i], f"{aucs[i].value()[0]:.6f}"])
-            logger.info(f"\n{p.get_string(title='AUC scores')}")
+            ave_auc = np.mean([k.value()[0] for k in aucs])
+            tbl_str = p.get_string(title=f"AUC scores (average {ave_auc:.6f})")
+            logger.info(f"\n{tbl_str}")
 
 
 # We want to visualize the output of the spatial transformers layer
