@@ -17,7 +17,7 @@ import torchnet as tnt
 
 from predict import Modelset, Predictor
 from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
-from model import Network
+from danet import Network
 from utils import logger, set_log_to_file, set_log_to_slack, print_versions
 from adamw import AdamW
 
@@ -46,8 +46,8 @@ class TrainModelset(Modelset):
         logger.info(f"using {len(datasets[0])}/{len(concat_set)} ({train_set_percent:.1f}%) entries for training dataset")
         logger.info(f"using {len(datasets[1])}/{len(concat_set)} ({test_set_percent:.1f}%) entries for testing dataset")
 
-        self.train_loader = DataLoader(datasets[0], batch_size=16, num_workers=16, shuffle=True, pin_memory=True)
-        self.test_loader = DataLoader(datasets[1], batch_size=16, num_workers=16, shuffle=False, pin_memory=True)
+        self.train_loader = DataLoader(datasets[0], batch_size=20, num_workers=20, shuffle=True, pin_memory=True)
+        self.test_loader = DataLoader(datasets[1], batch_size=20, num_workers=20, shuffle=False, pin_memory=True)
 
         self.out_dim = len(stanford_train_set.labels)
         self.labels = stanford_train_set.labels
@@ -62,7 +62,24 @@ class TrainModelset(Modelset):
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
         self.loss = nn.BCEWithLogitsLoss()
 
-    def save(self, filename):
+    def load_data_indices(self, filepath):
+        train_idx = filepath.joinpath("train.idx")
+        logger.debug(f"loading the train dataset indices from {train_idx}")
+        self.train_loader.dataset.indices = np.loadtxt(train_idx, dtype=np.int).tolist()
+        valid_idx = filepath.joinpath("valid.idx")
+        logger.debug(f"loading the valid dataset indices from {valid_idx}")
+        self.test_loader.dataset.indices = np.loadtxt(valid_idx, dtype=np.int).tolist()
+
+    def save_data_indices(self, filepath):
+        filepath.mkdir(mode=0o755, parents=True, exist_ok=True)
+        train_idx = filepath.joinpath("train.idx")
+        logger.debug(f"saving the train dataset indices to {train_idx}")
+        np.savetxt(train_idx, self.train_loader.dataset.indices, fmt="%d")
+        valid_idx = filepath.joinpath("valid.idx")
+        logger.debug(f"saving the valid dataset indices to {valid_idx}")
+        np.savetxt(valid_idx, self.test_loader.dataset.indices, fmt="%d")
+
+    def save_model(self, filename):
         filedir = Path(filename).parent.resolve()
         filedir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
@@ -86,7 +103,10 @@ class Trainer:
     def train(self, num_epoch, start_epoch=1):
         if start_epoch > 1:
             model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
-            self.modelset.load(model_path)
+            self.modelset.load_model(model_path)
+            self.modelset.load_data_indices(self.runtime_path)
+        else:
+            self.modelset.save_data_indices(self.runtime_path)
 
         for epoch in range(start_epoch, num_epoch + 1):
             self.train_epoch(epoch)
@@ -140,7 +160,7 @@ class Trainer:
         logger.info(f"train epoch {epoch:03d}:  "
                     f"loss {ave_loss.value()[0]:.6f}")
 
-        self.modelset.save(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.pth.tar"))
+        self.modelset.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.pth.tar"))
 
     def test(self, epoch):
         test_loader = self.modelset.test_loader
@@ -223,7 +243,7 @@ if __name__ == "__main__":
     parser.add_argument('--cuda', default=False, action='store_true', help="use GPU")
     parser.add_argument('--epoch', default=100, type=int, help="max number of epochs")
     parser.add_argument('--start-epoch', default=1, type=int, help="start epoch, especially need to continue from a stored model")
-    parser.add_argument('--runtime-dir', default='./train', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
+    parser.add_argument('--runtime-dir', default='./runtime', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
     parser.add_argument('--tensorboard', default=False, action='store_true', help="true if logging to tensorboard")
     parser.add_argument('--slack', default=False, action='store_true', help="true if logging to slack")
     args = parser.parse_args()

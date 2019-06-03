@@ -13,9 +13,9 @@ class Modelset:
         self.model = Network(out_dim, mode="per_study").to(device)
         self.device = device
         if model_file is not None:
-            self.load(model_file)
+            self.load_model(model_file)
 
-    def load(self, filename):
+    def load_model(self, filename):
         filepath = Path(filename).resolve()
         logger.debug(f"loading the model from {filepath}")
         states = torch.load(filepath, map_location=self.device)
