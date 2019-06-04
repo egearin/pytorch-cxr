@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import imageio
 import pandas as pd
 from tqdm import tqdm
@@ -26,6 +27,11 @@ def _group_study(images):
     cur_entry = None
 
     for (f, l) in sorted(images, key=lambda e: e[0]):
+        # remove the case if "No Finding" and findings except "Supported Device" are set at the same time
+        if l[0] and np.sum(l[1:-1]) != 0:
+            logger.error(f"image {f} has inconsistent labels {l}: removed.")
+            continue
+
         study = f.parent
         if cur_entry is None:
             cur_entry = ([f], l)
@@ -54,11 +60,10 @@ def _load_manifest(base_path, file_path, mode="per_study"):
     logger.debug(f"loading dataset manifest {file_path} ...")
     df = pd.read_csv(str(file_path)).fillna(0)
     #df = df.loc[df['AP/PA'] == 'PA']
-    LABELS = df.columns.values.tolist()[-14:]
     paths = df.iloc[:, 0].tolist()
+    LABELS = df.columns.values.tolist()[-14:]
     labels = df.replace(-1, 0).iloc[:, -14:].values.tolist()
     images = [(base_path.joinpath(p), l) for p, l in zip(paths, labels)]
-
     if mode == "per_image":
         entries = images
     elif mode == "per_study":
