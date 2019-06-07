@@ -7,11 +7,11 @@ from model import Network
 from utils import logger, print_versions
 
 
-class Modelset:
+class PredictEnvironment:
 
-    def __init__(self, out_dim, device="cpu", model_file=None):
-        self.model = Network(out_dim, mode="per_study").to(device)
+    def __init__(self, out_dim, device, model_file=None):
         self.device = device
+        self.model = Network(out_dim, mode="per_study").to(self.device)
         if model_file is not None:
             self.load_model(model_file)
 
@@ -24,8 +24,8 @@ class Modelset:
 
 class Predictor:
 
-    def __init__(self, modelset):
-        self.modelset = modelset
+    def __init__(self, env):
+        self.env = env
 
     def predict_study(self, study_dir):
         img_files = ["*.png", "*.jpg", "*.PNG", "*.JPG"]
@@ -39,10 +39,10 @@ class Predictor:
         return self.predict(image_tensor)
 
     def predict(self, data):
-        self.modelset.model.eval()
+        self.env.model.eval()
         with torch.no_grad():
-            data = data.to(device)
-            output = self.modelset.model(data)
+            data = data.to(self.env.device)
+            output = self.env.model(data)
         return output
 
 
@@ -67,8 +67,8 @@ if __name__ == "__main__":
     #model_path = Path(args.model).resolve()
     model_path = Path("train_20190526_per_study/model_epoch_030.pth.tar").resolve()
 
-    m = Modelset(14, device, model_path)
-    p = Predictor(m)
+    env = PredictEnvironment(14, device, model_path)
+    p = Predictor(env)
 
     study_dirs = ["/mnt/hdd/cxr/Stanford/full_resolution_version/CheXpert-v1.0/valid/patient64541/study1"]
     for s in study_dirs:

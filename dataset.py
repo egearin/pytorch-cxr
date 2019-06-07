@@ -13,9 +13,10 @@ from torchvision import transforms
 
 from utils import logger
 
-#STANFORD_CXR_BASE = Path("/mnt/hdd/cxr/Stanford/full_resolution_version").resolve()
-STANFORD_CXR_BASE = Path("/mnt/hdd/cxr/stanford/v1").resolve()
-MIMIC_CXR_BASE = Path("/mnt/hdd/cxr/mimic/v1").resolve()
+#CXR_BASE = Path("/mnt/hdd/cxr").resolve()
+CXR_BASE = Path("./data").resolve()
+STANFORD_CXR_BASE = CXR_BASE.joinpath("stanford/v1").resolve()
+MIMIC_CXR_BASE = CXR_BASE.joinpath("mimic/v1").resolve()
 
 MODES = ["per_image", "per_study"]
 

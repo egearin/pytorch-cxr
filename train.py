@@ -12,24 +12,30 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import ConcatDataset, Subset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+
 import torchvision
 import torchnet as tnt
 
-from predict import Modelset, Predictor
+from predict import PredictEnvironment, Predictor
 from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
 from danet import Network
-from utils import logger, set_log_to_file, set_log_to_slack, print_versions
+from utils import logger, set_log_to_file, set_log_to_slack, print_versions, get_devices
 from adamw import AdamW
 
 
-class TrainModelset(Modelset):
+class TrainEnvironment(PredictEnvironment):
     """
-    This modelset inherits Modelset from predict.py, with adding
-    the datasets and their corresponding data loaders,
+    This environment object inherits PredictEnvironment from predict.py,
+    with adding the datasets and their corresponding data loaders,
     optimizer, lr scheduler, and the loss function using in training.
     """
 
-    def __init__(self, device="cpu", model_file=None):
+    def __init__(self, devices, local_rank=None, model_file=None):
+        self.devices = devices
+        self.device = self.devices[0] if local_rank is None else self.devices[local_rank]
+
         stanford_train_set = StanfordDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
         stanford_test_set = StanfordDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
         mimic_train_set = StanfordDataset(MIMIC_CXR_BASE, "train.csv", mode="per_study")
@@ -56,11 +62,30 @@ class TrainModelset(Modelset):
         #plt.imshow(img.squeeze(), cmap='gray')
 
         # self.model will be loaded in super().__init__()
-        super().__init__(out_dim=self.out_dim, device=device, model_file=model_file)
+        super().__init__(out_dim=self.out_dim, device=self.device, model_file=model_file)
 
         self.optimizer = AdamW(self.model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
         self.loss = nn.BCEWithLogitsLoss()
+
+        if local_rank is not None:
+            self.to_distributed(local_rank)
+
+    def to_distributed(self, local_rank):
+        torch.cuda.set_device(self.device)
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.local_rank = local_rank
+        logger.info(f"initialized on {self.device} as rank {self.rank} of {self.world_size}")
+
+        self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device], output_device=self.device, find_unused_parameters=True)
+        train_set = self.train_loader.dataset
+        batch_size = self.train_loader.batch_size
+        num_workers = self.train_loader.num_workers
+        self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
+                                       sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
 
     def load_data_indices(self, filepath):
         train_idx = filepath.joinpath("train.idx")
@@ -71,6 +96,8 @@ class TrainModelset(Modelset):
         self.test_loader.dataset.indices = np.loadtxt(valid_idx, dtype=np.int).tolist()
 
     def save_data_indices(self, filepath):
+        if dist.is_initialized() and self.local_rank > 0:
+            return
         filepath.mkdir(mode=0o755, parents=True, exist_ok=True)
         train_idx = filepath.joinpath("train.idx")
         logger.debug(f"saving the train dataset indices to {train_idx}")
@@ -91,8 +118,8 @@ class TrainModelset(Modelset):
 
 class Trainer:
 
-    def __init__(self, modelset, runtime_path="train", tensorboard=False):
-        self.modelset = modelset
+    def __init__(self, env, runtime_path="train", tensorboard=False):
+        self.env = env
         self.runtime_path = runtime_path
         self.tensorboard = tensorboard
         if tensorboard:
@@ -103,20 +130,20 @@ class Trainer:
     def train(self, num_epoch, start_epoch=1):
         if start_epoch > 1:
             model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
-            self.modelset.load_model(model_path)
-            self.modelset.load_data_indices(self.runtime_path)
+            self.env.load_model(model_path)
+            self.env.load_data_indices(self.runtime_path)
         else:
-            self.modelset.save_data_indices(self.runtime_path)
+            self.env.save_data_indices(self.runtime_path)
 
         for epoch in range(start_epoch, num_epoch + 1):
             self.train_epoch(epoch)
             self.test(epoch)
 
     def train_epoch(self, epoch):
-        train_loader = self.modelset.train_loader
+        train_loader = self.env.train_loader
         train_set = train_loader.dataset
 
-        self.modelset.model.train()
+        self.env.model.train()
         progress = 0
 
         ave_len = len(train_loader) // 100 + 1
@@ -128,15 +155,15 @@ class Trainer:
 
         t = tqdm(enumerate(train_loader), total=len(train_loader), desc="training", ncols=150)
         for batch_idx, (data, target) in t:
-            data, target = data.to(device), target.to(device)
+            data, target = data.to(self.env.device), target.to(self.env.device)
 
-            self.modelset.optimizer.zero_grad()
-            output = self.modelset.model(data)
-            loss = self.modelset.loss(output, target)
+            self.env.optimizer.zero_grad()
+            output = self.env.model(data)
+            loss = self.env.loss(output, target)
             loss.backward()
-            self.modelset.optimizer.step()
+            self.env.optimizer.step()
 
-            #self.modelset.scheduler.step(loss.item())
+            #self.env.scheduler.step(loss.item())
 
             t.set_description(f"training (loss: {loss.item():.4f})")
             t.refresh()
@@ -160,27 +187,27 @@ class Trainer:
         logger.info(f"train epoch {epoch:03d}:  "
                     f"loss {ave_loss.value()[0]:.6f}")
 
-        self.modelset.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.pth.tar"))
+        self.env.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.pth.tar"))
 
     def test(self, epoch):
-        test_loader = self.modelset.test_loader
+        test_loader = self.env.test_loader
         test_set = test_loader.dataset
-        out_dim = self.modelset.out_dim
-        labels = self.modelset.labels
+        out_dim = self.env.out_dim
+        labels = self.env.labels
 
         aucs = [tnt.meter.AUCMeter() for i in range(out_dim)]
 
-        self.modelset.model.eval()
+        self.env.model.eval()
         with torch.no_grad():
             test_loss = 0
             correct = 0
 
-            ones = torch.ones((out_dim)).int().to(device)
-            zeros = torch.zeros((out_dim)).int().to(device)
+            ones = torch.ones((out_dim)).int().to(self.env.device)
+            zeros = torch.zeros((out_dim)).int().to(self.env.device)
             t = tqdm(enumerate(test_loader), total=len(test_loader), desc="testing", ncols=150)
             for batch_idx, (data, target) in t:
-                data, target = data.to(device), target.to(device)
-                output = self.modelset.model(data)
+                data, target = data.to(self.env.device), target.to(self.env.device)
+                output = self.env.model(data)
                 for i in range(out_dim):
                     aucs[i].add(output[:, i], target[:, i])
                 pred = torch.where(output > 0., ones, zeros)
@@ -236,28 +263,25 @@ def visualize_stn():
 
 
 if __name__ == "__main__":
+    import os
     import argparse
 
     parser = argparse.ArgumentParser(description="CXR Training")
     # for testing
-    parser.add_argument('--cuda', default=False, action='store_true', help="use GPU")
+    parser.add_argument('--cuda', default=None, type=str, help="use GPUs with its device ids, separated by commas")
     parser.add_argument('--epoch', default=100, type=int, help="max number of epochs")
     parser.add_argument('--start-epoch', default=1, type=int, help="start epoch, especially need to continue from a stored model")
     parser.add_argument('--runtime-dir', default='./runtime', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
     parser.add_argument('--tensorboard', default=False, action='store_true', help="true if logging to tensorboard")
     parser.add_argument('--slack', default=False, action='store_true', help="true if logging to slack")
+    parser.add_argument('--local_rank', type=int, help="this is for the use of torch.distributed.launch utility")
     args = parser.parse_args()
-
-    if args.cuda:
-        assert torch.cuda.is_available()
-        device = "cuda"
-    else:
-        device = "cpu"
 
     runtime_path = Path(args.runtime_dir).resolve()
     #runtime_path = Path("train_20190527_per_study_256").resolve()
 
-    set_log_to_file(runtime_path.joinpath("train.log"))
+    log_file = f"train.{args.local_rank}.log" if args.local_rank is not None else "train.log"
+    set_log_to_file(runtime_path.joinpath(log_file))
     if args.slack:
         set_log_to_slack(Path(__file__).parent.joinpath(".slack"), runtime_path.name)
 
@@ -265,9 +289,9 @@ if __name__ == "__main__":
     logger.info(f"runtime_path: {runtime_path}")
 
     # start training
-    m = TrainModelset(device)
-    t = Trainer(m, runtime_path=runtime_path, tensorboard=args.tensorboard)
-
+    devices = get_devices(args.cuda)
+    env = TrainEnvironment(devices, args.local_rank)
+    t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
     t.train(args.epoch, start_epoch=args.start_epoch)
 
     # Visualize the STN transformation on some input batch

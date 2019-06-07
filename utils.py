@@ -1,3 +1,4 @@
+import os
 import sys
 import logging
 from pathlib import Path
@@ -77,3 +78,18 @@ def set_log_to_slack(credential_file, ch_name):
 def print_versions():
     logger.info(f"pytorch version: {torch.__version__}")
     logger.info(f"torchvision version: {torchvision.__version__}")
+
+
+def get_devices(cuda=None):
+    if cuda is None:
+        logger.info(f"use CPUs")
+        return [torch.device("cpu")]
+    else:
+        assert torch.cuda.is_available()
+        avail_devices = list(range(torch.cuda.device_count()))
+        use_devices = [int(i) for i in cuda.split(",")]
+        assert max(use_devices) in avail_devices
+        logger.info(f"use cuda on GPU {use_devices}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in use_devices])
+        return [torch.device(f"cuda:{k}") for k in use_devices]
+
