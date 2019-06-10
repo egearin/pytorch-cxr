@@ -30,7 +30,7 @@ def _group_study(images):
     for (f, l) in sorted(images, key=lambda e: e[0]):
         # remove the case if "No Finding" and findings except "Supported Device" are set at the same time
         if l[0] and np.sum(l[1:-1]) != 0:
-            logger.error(f"image {f} has inconsistent labels {l}: removed.")
+            logger.warning(f"image {f} has inconsistent labels {l}: removed.")
             continue
 
         study = f.parent
@@ -63,7 +63,8 @@ def _load_manifest(base_path, file_path, mode="per_study"):
     #df = df.loc[df['AP/PA'] == 'PA']
     paths = df.iloc[:, 0].tolist()
     LABELS = df.columns.values.tolist()[-14:]
-    labels = df.replace(-1, 0).iloc[:, -14:].values.tolist()
+    # substitute uncertainty to positive
+    labels = df.replace(-1, 1).iloc[:, -14:].values.tolist()
     images = [(base_path.joinpath(p), l) for p, l in zip(paths, labels)]
     if mode == "per_image":
         entries = images

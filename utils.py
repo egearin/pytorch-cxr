@@ -8,29 +8,6 @@ import torch
 import torchvision
 
 
-formatter = logging.Formatter('%(asctime)s [%(levelname)-5s] %(message)s')
-
-# stream handler
-chdr = logging.StreamHandler(sys.stdout)
-chdr.setLevel(logging.DEBUG)
-chdr.setFormatter(formatter)
-
-logger = logging.getLogger("pytorch-stn")
-logger.setLevel(logging.DEBUG)
-logger.addHandler(chdr)
-
-
-def set_log_to_file(log_file):
-    log_path = Path(log_file).resolve()
-    Path.mkdir(log_path.parent, parents=True, exist_ok=True)
-
-    fhdr = logging.FileHandler(log_path)
-    fhdr.setLevel(logging.DEBUG)
-    fhdr.setFormatter(formatter)
-
-    logger.addHandler(fhdr)
-
-
 class SlackClientHandler(logging.Handler):
 
     def __init__(self, credential_file, ch_name):
@@ -64,15 +41,40 @@ class SlackClientHandler(logging.Handler):
             self.handleError(record)
 
 
-def set_log_to_slack(credential_file, ch_name):
-    try:
-        credential_path = Path(credential_file).resolve()
-        shdr = SlackClientHandler(credential_path, ch_name)
-        shdr.setLevel(logging.INFO)
-        shdr.setFormatter(formatter)
-        logger.addHandler(shdr)
-    except:
-        raise RuntimeError
+class MyLogger(logging.Logger):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.formatter = logging.Formatter('%(asctime)s [%(levelname)-5s] %(message)s')
+
+    def set_log_to_stream(self, level=logging.DEBUG):
+        chdr = logging.StreamHandler(sys.stdout)
+        chdr.setLevel(level)
+        chdr.setFormatter(self.formatter)
+        self.addHandler(chdr)
+
+    def set_log_to_file(self, log_file, level=logging.DEBUG):
+        log_path = Path(log_file).resolve()
+        Path.mkdir(log_path.parent, parents=True, exist_ok=True)
+        fhdr = logging.FileHandler(log_path)
+        fhdr.setLevel(level)
+        fhdr.setFormatter(self.formatter)
+        self.addHandler(fhdr)
+
+    def set_log_to_slack(self, credential_file, ch_name, level=logging.INFO):
+        try:
+            credential_path = Path(credential_file).resolve()
+            shdr = SlackClientHandler(credential_path, ch_name)
+            shdr.setLevel(level)
+            shdr.setFormatter(self.formatter)
+            self.addHandler(shdr)
+        except:
+            raise RuntimeError
+
+
+logging.setLoggerClass(MyLogger)
+logger = logging.getLogger("pytorch-cxr")
+logger.setLevel(logging.DEBUG)
 
 
 def print_versions():

@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 
 import numpy as np
 from tqdm import tqdm
@@ -21,7 +22,7 @@ import torchnet as tnt
 from predict import PredictEnvironment, Predictor
 from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
 from danet import Network
-from utils import logger, set_log_to_file, set_log_to_slack, print_versions, get_devices
+from utils import logger, print_versions, get_devices
 from adamw import AdamW
 
 
@@ -32,9 +33,15 @@ class TrainEnvironment(PredictEnvironment):
     optimizer, lr scheduler, and the loss function using in training.
     """
 
-    def __init__(self, devices, local_rank=None, model_file=None):
+    def __init__(self, devices, local_rank=None):
         self.devices = devices
-        self.device = self.devices[0] if local_rank is None else self.devices[local_rank]
+        self.local_rank = local_rank
+        if local_rank is None:
+            self.device = self.devices[0]
+            self.distributed = False
+        else:
+            self.device = self.devices[local_rank]
+            self.distributed = True
 
         stanford_train_set = StanfordDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
         stanford_test_set = StanfordDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
@@ -61,23 +68,21 @@ class TrainEnvironment(PredictEnvironment):
         #img, tar = datasets[0]
         #plt.imshow(img.squeeze(), cmap='gray')
 
-        # self.model will be loaded in super().__init__()
-        super().__init__(out_dim=self.out_dim, device=self.device, model_file=model_file)
+        super().__init__(out_dim=self.out_dim, device=self.device)
 
         self.optimizer = AdamW(self.model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
         self.loss = nn.BCEWithLogitsLoss()
 
-        if local_rank is not None:
-            self.to_distributed(local_rank)
+        if self.distributed:
+            self.to_distributed()
 
-    def to_distributed(self, local_rank):
+    def to_distributed(self):
         torch.cuda.set_device(self.device)
         dist.init_process_group(backend="nccl", init_method="env://")
 
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
-        self.local_rank = local_rank
         logger.info(f"initialized on {self.device} as rank {self.rank} of {self.world_size}")
 
         self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device], output_device=self.device, find_unused_parameters=True)
@@ -87,26 +92,28 @@ class TrainEnvironment(PredictEnvironment):
         self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
                                        sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
 
-    def load_data_indices(self, filepath):
-        train_idx = filepath.joinpath("train.idx")
+    def load_data_indices(self, runtime_path):
+        train_idx = runtime_path.joinpath("train.idx")
         logger.debug(f"loading the train dataset indices from {train_idx}")
         self.train_loader.dataset.indices = np.loadtxt(train_idx, dtype=np.int).tolist()
-        valid_idx = filepath.joinpath("valid.idx")
+        valid_idx = runtime_path.joinpath("valid.idx")
         logger.debug(f"loading the valid dataset indices from {valid_idx}")
         self.test_loader.dataset.indices = np.loadtxt(valid_idx, dtype=np.int).tolist()
 
-    def save_data_indices(self, filepath):
-        if dist.is_initialized() and self.local_rank > 0:
+    def save_data_indices(self, runtime_path):
+        if self.distributed and self.local_rank > 0:
             return
-        filepath.mkdir(mode=0o755, parents=True, exist_ok=True)
-        train_idx = filepath.joinpath("train.idx")
+        runtime_path.mkdir(mode=0o755, parents=True, exist_ok=True)
+        train_idx = runtime_path.joinpath("train.idx")
         logger.debug(f"saving the train dataset indices to {train_idx}")
         np.savetxt(train_idx, self.train_loader.dataset.indices, fmt="%d")
-        valid_idx = filepath.joinpath("valid.idx")
+        valid_idx = runtime_path.joinpath("valid.idx")
         logger.debug(f"saving the valid dataset indices to {valid_idx}")
         np.savetxt(valid_idx, self.test_loader.dataset.indices, fmt="%d")
 
     def save_model(self, filename):
+        if self.distributed and self.local_rank > 0:
+            return
         filedir = Path(filename).parent.resolve()
         filedir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
@@ -132,6 +139,7 @@ class Trainer:
             model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
             self.env.load_model(model_path)
             self.env.load_data_indices(self.runtime_path)
+            self.env.train_loader.sampler.set_epoch(start_epoch - 1)
         else:
             self.env.save_data_indices(self.runtime_path)
 
@@ -153,7 +161,16 @@ class Trainer:
         ckpts = iter(len(train_set) * np.arange(ckpt_step, 1 + ckpt_step, ckpt_step))
         ckpt = next(ckpts)
 
-        t = tqdm(enumerate(train_loader), total=len(train_loader), desc="training", ncols=150)
+        if self.env.distributed:
+            tqdm_desc = f"training{self.env.local_rank}"
+            tqdm_pos = self.env.local_rank
+        else:
+            tqdm_desc = "training"
+            tqdm_pos = 0
+
+        t = tqdm(enumerate(train_loader), total=len(train_loader), desc=tqdm_desc,
+                 dynamic_ncols=True, position=tqdm_pos)
+
         for batch_idx, (data, target) in t:
             data, target = data.to(self.env.device), target.to(self.env.device)
 
@@ -165,7 +182,7 @@ class Trainer:
 
             #self.env.scheduler.step(loss.item())
 
-            t.set_description(f"training (loss: {loss.item():.4f})")
+            t.set_description(f"{tqdm_desc} (loss: {loss.item():.4f})")
             t.refresh()
 
             ave_loss.add(loss.item())
@@ -202,9 +219,19 @@ class Trainer:
             test_loss = 0
             correct = 0
 
+            if self.env.distributed:
+                tqdm_desc = f"testing{self.env.local_rank}"
+                tqdm_pos = self.env.local_rank
+            else:
+                tqdm_desc = "testing"
+                tqdm_pos = 0
+
+            t = tqdm(enumerate(test_loader), total=len(test_loader), desc=tqdm_desc,
+                     dynamic_ncols=True, position=tqdm_pos)
+
             ones = torch.ones((out_dim)).int().to(self.env.device)
             zeros = torch.zeros((out_dim)).int().to(self.env.device)
-            t = tqdm(enumerate(test_loader), total=len(test_loader), desc="testing", ncols=150)
+
             for batch_idx, (data, target) in t:
                 data, target = data.to(self.env.device), target.to(self.env.device)
                 output = self.env.model(data)
@@ -280,8 +307,14 @@ if __name__ == "__main__":
     runtime_path = Path(args.runtime_dir).resolve()
     #runtime_path = Path("train_20190527_per_study_256").resolve()
 
-    log_file = f"train.{args.local_rank}.log" if args.local_rank is not None else "train.log"
-    set_log_to_file(runtime_path.joinpath(log_file))
+    # set logger
+    if args.local_rank is None:
+        log_file = "train.log"
+        logger.set_log_to_stream()
+    else:
+        log_file = f"train.{args.local_rank}.log"
+        logger.set_log_to_stream(level=logging.INFO)
+    logger.set_log_to_file(runtime_path.joinpath(log_file))
     if args.slack:
         set_log_to_slack(Path(__file__).parent.joinpath(".slack"), runtime_path.name)
 
