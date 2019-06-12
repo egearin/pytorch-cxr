@@ -78,7 +78,8 @@ class TrainEnvironment(PredictEnvironment):
             self.to_distributed()
 
     def to_distributed(self):
-        torch.cuda.set_device(self.device)
+        if self.device != torch.device("cpu"):
+            torch.cuda.set_device(self.device)
         dist.init_process_group(backend="nccl", init_method="env://")
 
         self.world_size = dist.get_world_size()
@@ -139,7 +140,8 @@ class Trainer:
             model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
             self.env.load_model(model_path)
             self.env.load_data_indices(self.runtime_path)
-            self.env.train_loader.sampler.set_epoch(start_epoch - 1)
+            if self.env.distributed:
+                self.env.train_loader.sampler.set_epoch(start_epoch - 1)
         else:
             self.env.save_data_indices(self.runtime_path)
 
