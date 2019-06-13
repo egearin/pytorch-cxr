@@ -109,7 +109,7 @@ class Attention(nn.Module):
 
 class Network(nn.Module):
 
-    def __init__(self, in_dim=20, out_dim=14):
+    def __init__(self, out_dim=14, in_dim=20, **kwargs):
         super().__init__()
 
         self.attn = Attention(embed_dim=256, num_heads=4)

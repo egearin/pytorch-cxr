@@ -21,7 +21,6 @@ import torchnet as tnt
 
 from predict import PredictEnvironment, Predictor
 from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
-from danet import Network
 from utils import logger, print_versions, get_devices
 from adamw import AdamW
 
@@ -80,7 +79,7 @@ class TrainEnvironment(PredictEnvironment):
     def to_distributed(self):
         if self.device != torch.device("cpu"):
             torch.cuda.set_device(self.device)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="gloo", init_method="env://")
 
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
