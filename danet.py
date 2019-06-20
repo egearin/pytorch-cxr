@@ -112,7 +112,7 @@ class Network(nn.Module):
     def __init__(self, out_dim=14, in_dim=20, **kwargs):
         super().__init__()
 
-        self.attn = Attention(embed_dim=256, num_heads=4)
+        self.attn = Attention(embed_dim=1024, num_heads=4)
 
         self.main = tvm.resnext101_32x8d(pretrained=True)
         self.main.conv1 = nn.Conv2d(in_dim, 64, kernel_size=7, stride=2, padding=3, bias=False)

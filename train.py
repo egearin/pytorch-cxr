@@ -9,11 +9,12 @@ from prettytable import PrettyTable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.distributed as dist
 from torch.utils.data import ConcatDataset, Subset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
-import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
 import torchvision
@@ -32,15 +33,9 @@ class TrainEnvironment(PredictEnvironment):
     optimizer, lr scheduler, and the loss function using in training.
     """
 
-    def __init__(self, devices, local_rank=None):
-        self.devices = devices
-        self.local_rank = local_rank
-        if local_rank is None:
-            self.device = self.devices[0]
-            self.distributed = False
-        else:
-            self.device = self.devices[local_rank]
-            self.distributed = True
+    def __init__(self, device):
+        self.device = device
+        self.distributed = False
 
         stanford_train_set = StanfordDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
         stanford_test_set = StanfordDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
@@ -58,8 +53,8 @@ class TrainEnvironment(PredictEnvironment):
         logger.info(f"using {len(datasets[0])}/{len(concat_set)} ({train_set_percent:.1f}%) entries for training dataset")
         logger.info(f"using {len(datasets[1])}/{len(concat_set)} ({test_set_percent:.1f}%) entries for testing dataset")
 
-        self.train_loader = DataLoader(datasets[0], batch_size=20, num_workers=20, shuffle=True, pin_memory=True)
-        self.test_loader = DataLoader(datasets[1], batch_size=20, num_workers=20, shuffle=False, pin_memory=True)
+        self.train_loader = DataLoader(datasets[0], batch_size=16, num_workers=32, shuffle=True, pin_memory=True)
+        self.test_loader = DataLoader(datasets[1], batch_size=16, num_workers=32, shuffle=False, pin_memory=True)
 
         self.out_dim = len(stanford_train_set.labels)
         self.labels = stanford_train_set.labels
@@ -73,25 +68,6 @@ class TrainEnvironment(PredictEnvironment):
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
         self.loss = nn.BCEWithLogitsLoss()
 
-        if self.distributed:
-            self.to_distributed()
-
-    def to_distributed(self):
-        if self.device != torch.device("cpu"):
-            torch.cuda.set_device(self.device)
-        dist.init_process_group(backend="gloo", init_method="env://")
-
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
-        logger.info(f"initialized on {self.device} as rank {self.rank} of {self.world_size}")
-
-        self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device], output_device=self.device, find_unused_parameters=True)
-        train_set = self.train_loader.dataset
-        batch_size = self.train_loader.batch_size
-        num_workers = self.train_loader.num_workers
-        self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
-                                       sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
-
     def load_data_indices(self, runtime_path):
         train_idx = runtime_path.joinpath("train.idx")
         logger.debug(f"loading the train dataset indices from {train_idx}")
@@ -101,8 +77,6 @@ class TrainEnvironment(PredictEnvironment):
         self.test_loader.dataset.indices = np.loadtxt(valid_idx, dtype=np.int).tolist()
 
     def save_data_indices(self, runtime_path):
-        if self.distributed and self.local_rank > 0:
-            return
         runtime_path.mkdir(mode=0o755, parents=True, exist_ok=True)
         train_idx = runtime_path.joinpath("train.idx")
         logger.debug(f"saving the train dataset indices to {train_idx}")
@@ -112,15 +86,48 @@ class TrainEnvironment(PredictEnvironment):
         np.savetxt(valid_idx, self.test_loader.dataset.indices, fmt="%d")
 
     def save_model(self, filename):
-        if self.distributed and self.local_rank > 0:
-            return
         filedir = Path(filename).parent.resolve()
         filedir.mkdir(mode=0o755, parents=True, exist_ok=True)
-
         filepath = Path(filename).resolve()
         logger.debug(f"saving the model to {filepath}")
         state = self.model.state_dict()
         torch.save(state, filename)
+
+
+class DistributedTrainEnvironment(TrainEnvironment):
+
+    def __init__(self, devices, local_rank):
+        super().__init__(devices[local_rank])
+
+        self.local_rank = local_rank
+        self.distributed = True
+
+        if self.device != torch.device("cpu"):
+            torch.cuda.set_device(self.device)
+
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        logger.info(f"initialized on {self.device} as rank {self.rank} of {self.world_size}")
+
+        self.model = DistributedDataParallel(self.model, device_ids=[self.device],
+                                             output_device=self.device, find_unused_parameters=True)
+        train_set = self.train_loader.dataset
+        batch_size = self.train_loader.batch_size
+        num_workers = self.train_loader.num_workers
+        self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
+                                       sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
+
+    def save_data_indices(self, runtime_path):
+        # save only if local_rank == 0
+        if self.local_rank == 0:
+            super().save_data_indices(runtime_path)
+
+    def save_model(self, filename):
+        # save only if local_rank == 0
+        if self.local_rank == 0:
+            super().save_model(filename)
 
 
 class Trainer:
@@ -291,18 +298,17 @@ def visualize_stn():
 
 
 if __name__ == "__main__":
-    import os
     import argparse
 
     parser = argparse.ArgumentParser(description="CXR Training")
-    # for testing
+    # for training
     parser.add_argument('--cuda', default=None, type=str, help="use GPUs with its device ids, separated by commas")
     parser.add_argument('--epoch', default=100, type=int, help="max number of epochs")
     parser.add_argument('--start-epoch', default=1, type=int, help="start epoch, especially need to continue from a stored model")
     parser.add_argument('--runtime-dir', default='./runtime', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
     parser.add_argument('--tensorboard', default=False, action='store_true', help="true if logging to tensorboard")
     parser.add_argument('--slack', default=False, action='store_true', help="true if logging to slack")
-    parser.add_argument('--local_rank', type=int, help="this is for the use of torch.distributed.launch utility")
+    parser.add_argument('--local_rank', default=None, type=int, help="this is for the use of torch.distributed.launch utility")
     args = parser.parse_args()
 
     runtime_path = Path(args.runtime_dir).resolve()
@@ -310,21 +316,26 @@ if __name__ == "__main__":
 
     # set logger
     if args.local_rank is None:
+        # non-distributed training
         log_file = "train.log"
         logger.set_log_to_stream()
     else:
+        # distributed training
         log_file = f"train.{args.local_rank}.log"
         logger.set_log_to_stream(level=logging.INFO)
+
     logger.set_log_to_file(runtime_path.joinpath(log_file))
     if args.slack:
         set_log_to_slack(Path(__file__).parent.joinpath(".slack"), runtime_path.name)
 
+    # print versions after logger.set_log_to_file() to log them into file
     print_versions()
     logger.info(f"runtime_path: {runtime_path}")
 
     # start training
     devices = get_devices(args.cuda)
-    env = TrainEnvironment(devices, args.local_rank)
+    env = TrainEnvironment(devices[0]) if args.local_rank is None \
+            else DistributedTrainEnvironment(devices, args.local_rank)
     t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
     t.train(args.epoch, start_epoch=args.start_epoch)
 
