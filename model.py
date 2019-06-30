@@ -87,11 +87,15 @@ class Network(nn.Module):
 
     def __init__(self, out_dim=14, mode="per_image"):
         super().__init__()
-        self.stn = STN()
-        self.winopt = WindowOptimizer()
-        self.main = tvm.resnext101_32x8d(pretrained=True)
-        self.main.conv1 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.main.fc = nn.Linear(self.main.fc.in_features, out_dim)
+        #self.stn = STN()
+        #self.winopt = WindowOptimizer()
+
+        #self.main = tvm.resnext101_32x8d(pretrained=True)
+        #self.main.conv1 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        #self.main.fc = nn.Linear(self.main.fc.in_features, out_dim)
+        self.main = tvm.densenet121(pretrained=True)
+        self.main.features.conv0 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.main.classifier = nn.Linear(self.main.classifier.in_features, out_dim)
         self.mode = mode
 
     def forward(self, x):

@@ -20,9 +20,11 @@ from torch.utils.data.distributed import DistributedSampler
 import torchvision
 import torchnet as tnt
 
+from apex import amp
+
 from predict import PredictEnvironment, Predictor
 from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
-from utils import logger, print_versions, get_devices
+from utils import logger, print_versions, get_devices, get_ip, get_commit
 from adamw import AdamW
 
 
@@ -33,7 +35,7 @@ class TrainEnvironment(PredictEnvironment):
     optimizer, lr scheduler, and the loss function using in training.
     """
 
-    def __init__(self, device):
+    def __init__(self, device, amp_enable=False):
         self.device = device
         self.distributed = False
 
@@ -53,8 +55,8 @@ class TrainEnvironment(PredictEnvironment):
         logger.info(f"using {len(datasets[0])}/{len(concat_set)} ({train_set_percent:.1f}%) entries for training dataset")
         logger.info(f"using {len(datasets[1])}/{len(concat_set)} ({test_set_percent:.1f}%) entries for testing dataset")
 
-        self.train_loader = DataLoader(datasets[0], batch_size=16, num_workers=32, shuffle=True, pin_memory=True)
-        self.test_loader = DataLoader(datasets[1], batch_size=16, num_workers=32, shuffle=False, pin_memory=True)
+        self.train_loader = DataLoader(datasets[0], batch_size=32, num_workers=8, shuffle=True, pin_memory=True)
+        self.test_loader = DataLoader(datasets[1], batch_size=32, num_workers=8, shuffle=False, pin_memory=True)
 
         self.out_dim = len(stanford_train_set.labels)
         self.labels = stanford_train_set.labels
@@ -68,22 +70,8 @@ class TrainEnvironment(PredictEnvironment):
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
         self.loss = nn.BCEWithLogitsLoss()
 
-    def load_data_indices(self, runtime_path):
-        train_idx = runtime_path.joinpath("train.idx")
-        logger.debug(f"loading the train dataset indices from {train_idx}")
-        self.train_loader.dataset.indices = np.loadtxt(train_idx, dtype=np.int).tolist()
-        valid_idx = runtime_path.joinpath("valid.idx")
-        logger.debug(f"loading the valid dataset indices from {valid_idx}")
-        self.test_loader.dataset.indices = np.loadtxt(valid_idx, dtype=np.int).tolist()
-
-    def save_data_indices(self, runtime_path):
-        runtime_path.mkdir(mode=0o755, parents=True, exist_ok=True)
-        train_idx = runtime_path.joinpath("train.idx")
-        logger.debug(f"saving the train dataset indices to {train_idx}")
-        np.savetxt(train_idx, self.train_loader.dataset.indices, fmt="%d")
-        valid_idx = runtime_path.joinpath("valid.idx")
-        logger.debug(f"saving the valid dataset indices to {valid_idx}")
-        np.savetxt(valid_idx, self.test_loader.dataset.indices, fmt="%d")
+        if amp_enable:
+            self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1")
 
     def save_model(self, filename):
         filedir = Path(filename).parent.resolve()
@@ -96,20 +84,20 @@ class TrainEnvironment(PredictEnvironment):
 
 class DistributedTrainEnvironment(TrainEnvironment):
 
-    def __init__(self, devices, local_rank):
-        super().__init__(devices[local_rank])
+    def __init__(self, devices, local_rank, amp_enable=False):
+        device = devices[local_rank]
+        torch.cuda.set_device(device)
 
-        self.local_rank = local_rank
-        self.distributed = True
-
-        if self.device != torch.device("cpu"):
-            torch.cuda.set_device(self.device)
-
+        logger.info(f"waiting other ranks ...")
         dist.init_process_group(backend="nccl", init_method="env://")
 
+        self.local_rank = local_rank
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
-        logger.info(f"initialized on {self.device} as rank {self.rank} of {self.world_size}")
+        logger.info(f"initialized on {device} as rank {self.rank} of {self.world_size}")
+
+        super().__init__(device, amp_enable=amp_enable)
+        self.distributed = True
 
         self.model = DistributedDataParallel(self.model, device_ids=[self.device],
                                              output_device=self.device, find_unused_parameters=True)
@@ -119,11 +107,6 @@ class DistributedTrainEnvironment(TrainEnvironment):
         self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
                                        sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
 
-    def save_data_indices(self, runtime_path):
-        # save only if local_rank == 0
-        if self.local_rank == 0:
-            super().save_data_indices(runtime_path)
-
     def save_model(self, filename):
         # save only if local_rank == 0
         if self.local_rank == 0:
@@ -132,28 +115,32 @@ class DistributedTrainEnvironment(TrainEnvironment):
 
 class Trainer:
 
-    def __init__(self, env, runtime_path="train", tensorboard=False):
+    def __init__(self, env, runtime_path="train", amp_enable=False, tensorboard=False):
         self.env = env
         self.runtime_path = runtime_path
+        self.amp_enable = amp_enable
         self.tensorboard = tensorboard
         if tensorboard:
             tblog_path = runtime_path.joinpath("tensorboard").resolve()
             tblog_path.mkdir(mode=0o755, parents=True, exist_ok=True)
             self.writer = SummaryWriter(log_dir=str(tblog_path))
+        self.progress = {
+            'loss': [],
+            'accuracy': [],
+            'auc_score': [],
+        }
 
     def train(self, num_epoch, start_epoch=1):
         if start_epoch > 1:
             model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
             self.env.load_model(model_path)
-            self.env.load_data_indices(self.runtime_path)
             if self.env.distributed:
                 self.env.train_loader.sampler.set_epoch(start_epoch - 1)
-        else:
-            self.env.save_data_indices(self.runtime_path)
 
         for epoch in range(start_epoch, num_epoch + 1):
             self.train_epoch(epoch)
             self.test(epoch)
+            self.save()
 
     def train_epoch(self, epoch):
         train_loader = self.env.train_loader
@@ -185,7 +172,11 @@ class Trainer:
             self.env.optimizer.zero_grad()
             output = self.env.model(data)
             loss = self.env.loss(output, target)
-            loss.backward()
+            if self.amp_enable:
+                with amp.scale_loss(loss, self.env.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
             self.env.optimizer.step()
 
             #self.env.scheduler.step(loss.item())
@@ -209,6 +200,7 @@ class Trainer:
 
             del loss
 
+        self.progress['loss'].append((epoch, ave_loss.value()[0].item()))
         logger.info(f"train epoch {epoch:03d}:  "
                     f"loss {ave_loss.value()[0]:.6f}")
 
@@ -266,6 +258,15 @@ class Trainer:
             tbl_str = p.get_string(title=f"AUC scores (average {ave_auc:.6f})")
             logger.info(f"\n{tbl_str}")
 
+        self.progress['accuracy'].append((epoch, correct / total))
+        self.progress['auc_score'].append((epoch, ave_auc))
+
+    def save(self):
+        import pickle
+        filepath = self.runtime_path.joinpath("train.pkl")
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.progress, f)
+
 
 # We want to visualize the output of the spatial transformers layer
 # after the training, we visualize a batch of input images and
@@ -303,6 +304,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CXR Training")
     # for training
     parser.add_argument('--cuda', default=None, type=str, help="use GPUs with its device ids, separated by commas")
+    parser.add_argument('--amp', default=False, action='store_true', help="use automatic mixed precision for faster training")
     parser.add_argument('--epoch', default=100, type=int, help="max number of epochs")
     parser.add_argument('--start-epoch', default=1, type=int, help="start epoch, especially need to continue from a stored model")
     parser.add_argument('--runtime-dir', default='./runtime', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
@@ -330,13 +332,22 @@ if __name__ == "__main__":
 
     # print versions after logger.set_log_to_file() to log them into file
     print_versions()
+    logger.info(f"runtime_ip: {get_ip()}")
+    logger.info(f"runtime_commit: {get_commit()}")
     logger.info(f"runtime_path: {runtime_path}")
+
+    # for fixed random indices
+    torch.manual_seed(2019)
+    np.random.seed(2019)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # start training
     devices = get_devices(args.cuda)
-    env = TrainEnvironment(devices[0]) if args.local_rank is None \
-            else DistributedTrainEnvironment(devices, args.local_rank)
-    t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
+    env = TrainEnvironment(devices[0], amp_enable=args.amp) if args.local_rank is None \
+            else DistributedTrainEnvironment(devices, args.local_rank, amp_enable=args.amp)
+
+    t = Trainer(env, runtime_path=runtime_path, amp_enable=args.amp, tensorboard=args.tensorboard)
     t.train(args.epoch, start_epoch=args.start_epoch)
 
     # Visualize the STN transformation on some input batch

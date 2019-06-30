@@ -95,3 +95,26 @@ def get_devices(cuda=None):
         os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in use_devices])
         return [torch.device(f"cuda:{k}") for k in use_devices]
 
+def get_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+def get_commit():
+    import git
+    repo = git.Repo(search_parent_directories=True)
+    assert not repo.is_dirty(), "current repository has some changes. please make a commit to run"
+
+    branch = repo.head.ref.name
+    sha = repo.head.commit.hexsha
+    dttm = repo.head.commit.committed_datetime
+    return f"{branch} / {sha} ({dttm})"
+
