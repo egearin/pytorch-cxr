@@ -93,7 +93,7 @@ class Network(nn.Module):
         #self.main = tvm.resnext101_32x8d(pretrained=True)
         #self.main.conv1 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
         #self.main.fc = nn.Linear(self.main.fc.in_features, out_dim)
-        self.main = tvm.densenet121(pretrained=True)
+        self.main = tvm.densenet121(pretrained=True, drop_rate=0.5)
         self.main.features.conv0 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.main.classifier = nn.Linear(self.main.classifier.in_features, out_dim)
         self.mode = mode

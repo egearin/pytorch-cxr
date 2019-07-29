@@ -20,7 +20,12 @@ class PredictEnvironment:
         filepath = Path(filename).resolve()
         logger.debug(f"loading the model from {filepath}")
         states = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(states)
+        try:
+            self.model.load_state_dict(states, strict=True)
+        except:
+            # remove 'module.' from keys due to DDP
+            new_states = { k.replace('module.', ''): v for k, v in states.items() }
+            self.model.load_state_dict(new_states, strict=True)
 
 
 class Predictor:

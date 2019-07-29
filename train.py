@@ -1,5 +1,5 @@
 from pathlib import Path
-import logging
+import pickle
 
 import numpy as np
 from tqdm import tqdm
@@ -23,9 +23,21 @@ import torchnet as tnt
 from apex import amp
 
 from predict import PredictEnvironment, Predictor
-from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, StanfordDataset
+from dataset import STANFORD_CXR_BASE, MIMIC_CXR_BASE, CxrDataset, CxrConcatDataset, CxrSubset, cxr_random_split
 from utils import logger, print_versions, get_devices, get_ip, get_commit
 from adamw import AdamW
+
+
+def check_distributed(args):
+    devices = get_devices(args.cuda)
+    if args.local_rank is None:
+        return False, devices[0]
+    else:
+        device = devices[args.local_rank]
+        torch.cuda.set_device(device)
+        logger.info(f"waiting other ranks ...")
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return True, device
 
 
 class TrainEnvironment(PredictEnvironment):
@@ -38,40 +50,48 @@ class TrainEnvironment(PredictEnvironment):
     def __init__(self, device, amp_enable=False):
         self.device = device
         self.distributed = False
+        self.amp = amp_enable
 
-        stanford_train_set = StanfordDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
-        stanford_test_set = StanfordDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
-        mimic_train_set = StanfordDataset(MIMIC_CXR_BASE, "train.csv", mode="per_study")
-        mimic_test_set = StanfordDataset(MIMIC_CXR_BASE, "valid.csv", mode="per_study")
-        concat_set = ConcatDataset([stanford_train_set, stanford_test_set, mimic_train_set, mimic_test_set])
+        self.local_rank = 0
+        self.rank = 0
 
-        num_test = 20000
-        datasets = random_split(concat_set, [len(concat_set) - num_test, num_test])
+        stanford_train_set = CxrDataset(STANFORD_CXR_BASE, "train.csv", mode="per_study")
+        stanford_test_set = CxrDataset(STANFORD_CXR_BASE, "valid.csv", mode="per_study")
+
+        mimic_train_set = CxrDataset(MIMIC_CXR_BASE, "train.csv", mode="per_study")
+        mimic_test_set = CxrDataset(MIMIC_CXR_BASE, "valid.csv", mode="per_study")
+
+        concat_set = CxrConcatDataset([stanford_train_set, stanford_test_set, mimic_train_set, mimic_test_set])
+
+        datasets = cxr_random_split(concat_set, [360000, 15000])
+        #datasets = cxr_random_split(concat_set, [40000, 20000])
         #subset = Subset(concat_set, range(0, 36))
         #datasets = random_split(subset, [len(subset) - 12, 12])
 
-        train_set_percent = len(datasets[0]) / len(concat_set) * 100.
-        test_set_percent = len(datasets[1]) / len(concat_set) * 100.
-        logger.info(f"using {len(datasets[0])}/{len(concat_set)} ({train_set_percent:.1f}%) entries for training dataset")
-        logger.info(f"using {len(datasets[1])}/{len(concat_set)} ({test_set_percent:.1f}%) entries for testing dataset")
+        pin_memory = True if self.device.type == 'cuda' else False
+        self.train_loader = DataLoader(datasets[0], batch_size=32, num_workers=16, shuffle=True, pin_memory=pin_memory)
+        self.test_loader = DataLoader(datasets[1], batch_size=32, num_workers=16, shuffle=False, pin_memory=pin_memory)
 
-        self.train_loader = DataLoader(datasets[0], batch_size=32, num_workers=8, shuffle=True, pin_memory=True)
-        self.test_loader = DataLoader(datasets[1], batch_size=32, num_workers=8, shuffle=False, pin_memory=True)
-
-        self.out_dim = len(stanford_train_set.labels)
-        self.labels = stanford_train_set.labels
+        self.labels = datasets[0].labels
+        self.out_dim = len(self.labels)
+        self.positive_weights = torch.FloatTensor(self.get_positive_weights()).to(device)
 
         #img, tar = datasets[0]
         #plt.imshow(img.squeeze(), cmap='gray')
 
         super().__init__(out_dim=self.out_dim, device=self.device)
 
-        self.optimizer = AdamW(self.model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
+        self.optimizer = AdamW(self.model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2)
         #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
-        self.loss = nn.BCEWithLogitsLoss()
+        self.loss = nn.BCEWithLogitsLoss(pos_weight=self.positive_weights)
 
-        if amp_enable:
+        if self.amp:
             self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1")
+
+    def get_positive_weights(self):
+        df = self.train_loader.dataset.get_label_counts()
+        ratio = df.loc[0] / df.loc[1]
+        return ratio.values.tolist()
 
     def save_model(self, filename):
         filedir = Path(filename).parent.resolve()
@@ -84,41 +104,35 @@ class TrainEnvironment(PredictEnvironment):
 
 class DistributedTrainEnvironment(TrainEnvironment):
 
-    def __init__(self, devices, local_rank, amp_enable=False):
-        device = devices[local_rank]
-        torch.cuda.set_device(device)
-
-        logger.info(f"waiting other ranks ...")
-        dist.init_process_group(backend="nccl", init_method="env://")
-
+    def __init__(self, device, local_rank, amp_enable=False):
+        super().__init__(device, amp_enable=amp_enable)
+        self.distributed = True
         self.local_rank = local_rank
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
         logger.info(f"initialized on {device} as rank {self.rank} of {self.world_size}")
 
-        super().__init__(device, amp_enable=amp_enable)
-        self.distributed = True
-
         self.model = DistributedDataParallel(self.model, device_ids=[self.device],
                                              output_device=self.device, find_unused_parameters=True)
-        train_set = self.train_loader.dataset
-        batch_size = self.train_loader.batch_size
-        num_workers = self.train_loader.num_workers
-        self.train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=num_workers,
-                                       sampler=DistributedSampler(train_set), shuffle=False, pin_memory=True)
 
-    def save_model(self, filename):
-        # save only if local_rank == 0
-        if self.local_rank == 0:
-            super().save_model(filename)
+        pin_memory = True if self.device.type == 'cuda' else False
+        self.train_loader = DataLoader(self.train_loader.dataset,
+                                       batch_size=self.train_loader.batch_size,
+                                       num_workers=self.train_loader.num_workers,
+                                       sampler=DistributedSampler(self.train_loader.dataset),
+                                       shuffle=False, pin_memory=pin_memory)
+        self.test_loader = DataLoader(self.test_loader.dataset,
+                                      batch_size=self.test_loader.batch_size,
+                                      num_workers=self.test_loader.num_workers,
+                                      sampler=DistributedSampler(self.test_loader.dataset),
+                                      shuffle=False, pin_memory=pin_memory)
 
 
 class Trainer:
 
-    def __init__(self, env, runtime_path="train", amp_enable=False, tensorboard=False):
+    def __init__(self, env, runtime_path="train", tensorboard=False):
         self.env = env
         self.runtime_path = runtime_path
-        self.amp_enable = amp_enable
         self.tensorboard = tensorboard
         if tensorboard:
             tblog_path = runtime_path.joinpath("tensorboard").resolve()
@@ -130,22 +144,29 @@ class Trainer:
             'auc_score': [],
         }
 
+        train_set_percent = len(self.env.train_loader.sampler) / len(self.env.train_loader.dataset) * 100.
+        test_set_percent = len(self.env.test_loader.sampler) / len(self.env.test_loader.dataset) * 100.
+        logger.info(f"using {len(self.env.train_loader.sampler)}/{len(self.env.train_loader.dataset)} ({train_set_percent:.1f}%) entries for training")
+        logger.info(f"using {len(self.env.test_loader.sampler)}/{len(self.env.test_loader.dataset)} ({test_set_percent:.1f}%) entries for testing")
+
     def train(self, num_epoch, start_epoch=1):
         if start_epoch > 1:
-            model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.pth.tar")
+            model_path = runtime_path.joinpath(f"model_epoch_{(start_epoch - 1):03d}.{self.env.rank}.pth.tar")
             self.env.load_model(model_path)
             if self.env.distributed:
                 self.env.train_loader.sampler.set_epoch(start_epoch - 1)
+            self.load()
 
         for epoch in range(start_epoch, num_epoch + 1):
             self.train_epoch(epoch)
-            self.test(epoch)
+            self.test(epoch, self.env.test_loader)
             self.save()
 
     def train_epoch(self, epoch):
         train_loader = self.env.train_loader
         train_set = train_loader.dataset
 
+        CxrDataset.train()
         self.env.model.train()
         progress = 0
 
@@ -156,12 +177,8 @@ class Trainer:
         ckpts = iter(len(train_set) * np.arange(ckpt_step, 1 + ckpt_step, ckpt_step))
         ckpt = next(ckpts)
 
-        if self.env.distributed:
-            tqdm_desc = f"training{self.env.local_rank}"
-            tqdm_pos = self.env.local_rank
-        else:
-            tqdm_desc = "training"
-            tqdm_pos = 0
+        tqdm_desc = f"training [{self.env.rank}]"
+        tqdm_pos = self.env.local_rank
 
         t = tqdm(enumerate(train_loader), total=len(train_loader), desc=tqdm_desc,
                  dynamic_ncols=True, position=tqdm_pos)
@@ -172,7 +189,7 @@ class Trainer:
             self.env.optimizer.zero_grad()
             output = self.env.model(data)
             loss = self.env.loss(output, target)
-            if self.amp_enable:
+            if self.env.amp:
                 with amp.scale_loss(loss, self.env.optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
@@ -204,27 +221,23 @@ class Trainer:
         logger.info(f"train epoch {epoch:03d}:  "
                     f"loss {ave_loss.value()[0]:.6f}")
 
-        self.env.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.pth.tar"))
+        self.env.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.{self.env.rank}.pth.tar"))
 
-    def test(self, epoch):
-        test_loader = self.env.test_loader
+    def test(self, epoch, test_loader, prefix=""):
         test_set = test_loader.dataset
         out_dim = self.env.out_dim
         labels = self.env.labels
 
         aucs = [tnt.meter.AUCMeter() for i in range(out_dim)]
 
+        CxrDataset.eval()
         self.env.model.eval()
         with torch.no_grad():
             test_loss = 0
             correct = 0
 
-            if self.env.distributed:
-                tqdm_desc = f"testing{self.env.local_rank}"
-                tqdm_pos = self.env.local_rank
-            else:
-                tqdm_desc = "testing"
-                tqdm_pos = 0
+            tqdm_desc = f"{prefix}testing [{self.env.rank}]"
+            tqdm_pos = self.env.local_rank
 
             t = tqdm(enumerate(test_loader), total=len(test_loader), desc=tqdm_desc,
                      dynamic_ncols=True, position=tqdm_pos)
@@ -241,13 +254,13 @@ class Trainer:
                 correct += pred.eq(target.int()).sum().item()
 
             #correct /= out_dim
-            total = len(test_set) * out_dim
+            total = len(test_loader.sampler) * out_dim
             percent = 100. * correct / total
             if self.tensorboard:
-                self.writer.add_scalar("accuracy", percent, global_step=epoch)
+                self.writer.add_scalar(f"{prefix}accuracy", percent, global_step=epoch)
 
             logger.info(f"val epoch {epoch:03d}:  "
-                        f"accuracy {correct}/{total} "
+                        f"{prefix}accuracy {correct}/{total} "
                         f"({percent:.2f}%)")
 
             p = PrettyTable()
@@ -255,15 +268,19 @@ class Trainer:
             for i in range(out_dim):
                 p.add_row([labels[i], f"{aucs[i].value()[0]:.6f}"])
             ave_auc = np.mean([k.value()[0] for k in aucs])
-            tbl_str = p.get_string(title=f"AUC scores (average {ave_auc:.6f})")
+            tbl_str = p.get_string(title=f"{prefix}auc scores (average {ave_auc:.6f})")
             logger.info(f"\n{tbl_str}")
 
-        self.progress['accuracy'].append((epoch, correct / total))
-        self.progress['auc_score'].append((epoch, ave_auc))
+        self.progress[f'{prefix}accuracy'].append((epoch, correct / total))
+        self.progress[f'{prefix}auc_score'].append((epoch, ave_auc))
+
+    def load(self):
+        filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
+        with open(filepath, 'rb') as f:
+            self.progress = pickle.load(f)
 
     def save(self):
-        import pickle
-        filepath = self.runtime_path.joinpath("train.pkl")
+        filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
         with open(filepath, 'wb') as f:
             pickle.dump(self.progress, f)
 
@@ -298,6 +315,43 @@ def visualize_stn():
         axarr[1].set_title('Transformed Images')
 
 
+def initialize(args):
+    if args.amp:
+        assert args.cuda is not None
+
+    runtime_path = Path('./runtime', args.runtime_dir).resolve()
+    #runtime_path = Path("train_20190527_per_study_256").resolve()
+
+    # check if distributed or not
+    distributed, device = check_distributed(args)
+
+    # set logger
+    local_rank = args.local_rank if distributed else 0
+    rank = dist.get_rank() if distributed else 0
+    logger.set_rank(rank)
+
+    log_file = f"train.{rank}.log"
+    logger.set_log_to_stream()
+    logger.set_log_to_file(runtime_path.joinpath(log_file))
+    if args.slack:
+        logger.set_log_to_slack(Path(__file__).parent.joinpath(".slack"), runtime_path.name)
+
+    # print versions after logger.set_log_to_file() to log them into file
+    print_versions()
+    run_mode = "distributed" if distributed else "single"
+    logger.info(f"runtime node: {get_ip()} ({run_mode}, rank: {rank}, local_rank: {local_rank})")
+    logger.info(f"runtime commit: {get_commit()}")
+    logger.info(f"runtime path: {runtime_path}")
+
+    # for fixed random indices
+    torch.manual_seed(2019)
+    np.random.seed(2019)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    return distributed, runtime_path, device
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -307,47 +361,19 @@ if __name__ == "__main__":
     parser.add_argument('--amp', default=False, action='store_true', help="use automatic mixed precision for faster training")
     parser.add_argument('--epoch', default=100, type=int, help="max number of epochs")
     parser.add_argument('--start-epoch', default=1, type=int, help="start epoch, especially need to continue from a stored model")
-    parser.add_argument('--runtime-dir', default='./runtime', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
+    parser.add_argument('--runtime-dir', default='current', type=str, help="runtime directory to store log, pretrained models, and tensorboard metadata")
     parser.add_argument('--tensorboard', default=False, action='store_true', help="true if logging to tensorboard")
     parser.add_argument('--slack', default=False, action='store_true', help="true if logging to slack")
     parser.add_argument('--local_rank', default=None, type=int, help="this is for the use of torch.distributed.launch utility")
     args = parser.parse_args()
 
-    runtime_path = Path(args.runtime_dir).resolve()
-    #runtime_path = Path("train_20190527_per_study_256").resolve()
-
-    # set logger
-    if args.local_rank is None:
-        # non-distributed training
-        log_file = "train.log"
-        logger.set_log_to_stream()
-    else:
-        # distributed training
-        log_file = f"train.{args.local_rank}.log"
-        logger.set_log_to_stream(level=logging.INFO)
-
-    logger.set_log_to_file(runtime_path.joinpath(log_file))
-    if args.slack:
-        set_log_to_slack(Path(__file__).parent.joinpath(".slack"), runtime_path.name)
-
-    # print versions after logger.set_log_to_file() to log them into file
-    print_versions()
-    logger.info(f"runtime_ip: {get_ip()}")
-    logger.info(f"runtime_commit: {get_commit()}")
-    logger.info(f"runtime_path: {runtime_path}")
-
-    # for fixed random indices
-    torch.manual_seed(2019)
-    np.random.seed(2019)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    distributed, runtime_path, device = initialize(args)
 
     # start training
-    devices = get_devices(args.cuda)
-    env = TrainEnvironment(devices[0], amp_enable=args.amp) if args.local_rank is None \
-            else DistributedTrainEnvironment(devices, args.local_rank, amp_enable=args.amp)
+    env = DistributedTrainEnvironment(device, args.local_rank, amp_enable=args.amp) if distributed else \
+          TrainEnvironment(device, amp_enable=args.amp)
 
-    t = Trainer(env, runtime_path=runtime_path, amp_enable=args.amp, tensorboard=args.tensorboard)
+    t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
     t.train(args.epoch, start_epoch=args.start_epoch)
 
     # Visualize the STN transformation on some input batch

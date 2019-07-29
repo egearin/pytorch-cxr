@@ -7,6 +7,11 @@ import yaml
 import torch
 import torchvision
 
+# in order to avoid complaining warning from tensorflow logger
+import absl.logging
+logging.root.removeHandler(absl.logging._absl_handler)
+absl.logging._warn_preinit_stderr = False
+
 
 class SlackClientHandler(logging.Handler):
 
@@ -41,11 +46,27 @@ class SlackClientHandler(logging.Handler):
             self.handleError(record)
 
 
+class MyFilter(logging.Filter):
+
+    def __init__(self, rank, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rank = rank
+
+    def filter(self, record):
+        record.rank = self.rank
+        return True
+
+
 class MyLogger(logging.Logger):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.formatter = logging.Formatter('%(asctime)s [%(levelname)-5s] %(message)s')
+        self.addFilter(MyFilter(0))
+        self.formatter = logging.Formatter('%(asctime)s %(rank)s [%(levelname)-5s] %(message)s')
+
+    def set_rank(self, rank):
+        self.removeFilter(self.filter)
+        self.addFilter(MyFilter(rank))
 
     def set_log_to_stream(self, level=logging.DEBUG):
         chdr = logging.StreamHandler(sys.stdout)
@@ -113,7 +134,10 @@ def get_commit():
     repo = git.Repo(search_parent_directories=True)
     assert not repo.is_dirty(), "current repository has some changes. please make a commit to run"
 
-    branch = repo.head.ref.name
+    try:
+        branch = repo.head.ref.name
+    except TypeError:
+        branch = "(detached)"
     sha = repo.head.commit.hexsha
     dttm = repo.head.commit.committed_datetime
     return f"{branch} / {sha} ({dttm})"

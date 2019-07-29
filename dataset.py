@@ -1,4 +1,5 @@
 import sys
+import bisect
 from pathlib import Path
 
 import numpy as np
@@ -8,8 +9,8 @@ from tqdm import tqdm
 from PIL import Image
 
 import torch
-from torch.utils.data import Dataset, Subset
-from torchvision import transforms
+from torch.utils.data import Dataset, ConcatDataset, Subset
+import torchvision.transforms as tfms
 
 from utils import logger
 
@@ -17,42 +18,12 @@ from utils import logger
 CXR_BASE = Path("./data").resolve()
 STANFORD_CXR_BASE = CXR_BASE.joinpath("stanford/v1").resolve()
 MIMIC_CXR_BASE = CXR_BASE.joinpath("mimic/v1").resolve()
+NIH_CXR_BASE = CXR_BASE.joinpath("nih/v1").resolve()
 
 MODES = ["per_image", "per_study"]
 
 
-def _group_study(images):
-    prev_study = None
-    num_images_per_entry = []
-    entries = []
-    cur_entry = None
-
-    for (f, l) in sorted(images, key=lambda e: e[0]):
-        # remove the case if "No Finding" and findings except "Supported Device" are set at the same time
-        if l[0] and np.sum(l[1:-1]) != 0:
-            logger.warning(f"image {f} has inconsistent labels {l}: removed.")
-            continue
-
-        study = f.parent
-        if cur_entry is None:
-            cur_entry = ([f], l)
-        if study == prev_study:
-            cur_entry[0].append(f)
-            assert cur_entry[1] == l
-        else:
-            num_images_per_entry.append(len(cur_entry[0]))
-            #if len(cur_entry[0]) > 3:
-            #    print(f"{study} has {len(cur_entry[0])} images.. only 3 images are used.")
-            #    cur_entry = (cur_entry[0][:3], cur_entry[1])
-            entries.append(cur_entry)
-            cur_entry = ([f], l)
-        prev_study = study
-
-    logger.debug(f"max images per study: {max(num_images_per_entry)}")
-    return entries
-
-
-def _load_manifest(base_path, file_path, mode="per_study"):
+def _load_manifest(file_path, num_labels=14, mode="per_study"):
     assert mode in MODES
     if not file_path.exists():
         logger.error(f"manifest file {file_path} not found.")
@@ -61,73 +32,171 @@ def _load_manifest(base_path, file_path, mode="per_study"):
     logger.debug(f"loading dataset manifest {file_path} ...")
     df = pd.read_csv(str(file_path)).fillna(0)
     #df = df.loc[df['AP/PA'] == 'PA']
-    paths = df.iloc[:, 0].tolist()
-    LABELS = df.columns.values.tolist()[-14:]
-    # substitute uncertainty to positive
-    labels = df.replace(-1, 1).iloc[:, -14:].values.tolist()
-    images = [(base_path.joinpath(p), l) for p, l in zip(paths, labels)]
+    LABELS = df.columns[-num_labels:].values.tolist()
+    if LABELS[0] != "No Finding":
+        idx = LABELS.index("No Finding")
+        LABELS[0], LABELS[idx] = LABELS[idx], LABELS[0]
+    paths = df[df.columns[0]]
+    labels = df[LABELS].astype(int).replace(-1, 1)  # substitute uncertainty to positive
+    df_tmp = pd.concat([paths, labels], axis=1)
     if mode == "per_image":
-        entries = images
+        entries = df_tmp
     elif mode == "per_study":
-        entries = _group_study(images)
+        logger.debug("grouping by studies ... ")
+        df_tmp['study'] = [Path(x).parent for x in df_tmp[df_tmp.columns[0]]]
+        df_tmp.set_index(['study'], inplace=True)
+        aggs = { df_tmp.columns[0]: lambda x: ','.join(x.astype(str)) }
+        aggs.update({ x: 'mean' for x in LABELS })
+        df_tmp = df_tmp.groupby(['study']).agg(aggs).reset_index(0, drop=True)
+        entries = df_tmp
     else:
         raise RuntimeError
 
     logger.debug(f"{len(entries)} entries are loaded.")
-    return entries, LABELS
+    return entries
 
 
-cxr_transforms = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize(300, Image.LANCZOS),
-    transforms.RandomRotation((-10, 10)),
-    transforms.RandomCrop((256, 256)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.ToTensor(),
-    #transforms.Normalize((0.1307,), (0.3081,))
+cxr_train_transforms = tfms.Compose([
+    tfms.ToPILImage(),
+    tfms.Resize(300, Image.LANCZOS),
+    tfms.RandomRotation((-10, 10)),
+    tfms.RandomCrop((256, 256)),
+    tfms.RandomHorizontalFlip(),
+    tfms.RandomVerticalFlip(),
+    tfms.ToTensor(),
+    #tfms.Normalize((0.1307,), (0.3081,))
+])
+
+cxr_test_transforms = tfms.Compose([
+    tfms.ToPILImage(),
+    tfms.Resize(256, Image.LANCZOS),
+    tfms.CenterCrop(256),
+    tfms.ToTensor(),
+    #tfms.Normalize((0.1307,), (0.3081,))
 ])
 
 
-def get_image(img_path):
+def get_image(img_path, transforms):
     image = imageio.imread(img_path)
-    image_tensor = cxr_transforms(image)
+    image_tensor = transforms(image)
     return image_tensor
 
 
-def get_study(img_paths):
+def get_study(img_paths, transforms):
     max_imgs = 20
     image_tensor = torch.zeros(max_imgs, 256, 256)
     for i, img_path in enumerate(img_paths):
         image = imageio.imread(img_path)
-        image_tensor[i, :, :] = cxr_transforms(image)
-    image_tensor = image_tensor[torch.randperm(max_imgs), :, :]
+        image_tensor[i, :, :] = transforms(image)
+    if transforms == cxr_train_transforms:
+        image_tensor = image_tensor[torch.randperm(max_imgs), :, :]
     return image_tensor
 
 
-class StanfordDataset(Dataset):
+class CxrDataset(Dataset):
 
-    def __init__(self, base_path, manifest_file, mode="per_study", *args, **kwargs):
+    transforms = cxr_train_transforms
+
+    def __init__(self, base_path, manifest_file, num_labels=14, mode="per_study", *args, **kwargs):
         super().__init__(*args, **kwargs)
         manifest_path = base_path.joinpath(manifest_file).resolve()
-        self.entries, self.labels = _load_manifest(base_path, manifest_path, mode)
+        self.entries = _load_manifest(manifest_path, num_labels, mode)
+        self.base_path = base_path
         self.mode = mode
 
     def __getitem__(self, index):
+
+        def get_entries(index):
+            df = self.entries.loc[index]
+            paths = [self.base_path.joinpath(x).resolve() for x in df[0].split(',')]
+            label = df[1:].tolist()
+            return paths, label
+
         if self.mode == "per_image":
-            img_path, label = self.entries[index]
-            image_tensor = get_image(img_path)
+            img_path, label = get_entries(index)
+            image_tensor = get_image(img_path, CxrDataset.transforms)
             target_tensor = torch.FloatTensor(label)
         elif self.mode == "per_study":
-            img_paths, label = self.entries[index]
-            image_tensor = get_study(img_paths)
+            img_paths, label = get_entries(index)
+            image_tensor = get_study(img_paths, CxrDataset.transforms)
             target_tensor = torch.FloatTensor(label)
         else:
             raise RuntimeError
+
         return image_tensor, target_tensor
 
     def __len__(self):
         return len(self.entries)
+
+    def get_label_counts(self, indices=None):
+        df = self.entries if indices is None else self.entries.loc[indices]
+        counts = [df[x].value_counts() for x in self.labels]
+        new_df = pd.concat(counts, axis=1).fillna(0).astype(int)
+        return new_df
+
+    @property
+    def labels(self):
+        return self.entries.columns[1:].values.tolist()
+
+    @staticmethod
+    def train():
+        CxrDataset.transforms = cxr_train_transforms
+
+    @staticmethod
+    def eval():
+        CxrDataset.transforms = cxr_test_transforms
+
+
+class CxrConcatDataset(ConcatDataset):
+
+    #def __init__(self, *args, **kwargs):
+    #    super().__init__(*args, **kwargs)
+    #    self.get_label_counts()
+
+    def get_label_counts(self, indices=None):
+        if indices is None:
+            indices = list(range(self.__len__()))
+        dataset_indices = [bisect.bisect_right(self.cumulative_sizes, idx) for idx in indices]
+        sample_indices = [(i if d == 0 else i - self.cumulative_sizes[d - 1]) for i, d in zip(indices, dataset_indices)]
+        nested_indices = [[] for d in self.datasets]
+        for d, s in zip(dataset_indices, sample_indices):
+            nested_indices[d].append(s)
+        dfs = []
+        for d, dataset in enumerate(self.datasets):
+            dfs.append(dataset.get_label_counts(nested_indices[d]))
+        df = pd.concat(dfs, sort=False).groupby(level=0).sum().astype(int)
+        for dataset in self.datasets:
+            assert len(df.columns) == len(dataset.labels), "label names should be matched!"
+        return df
+
+    @property
+    def labels(self):
+        return self.datasets[0].labels
+
+
+class CxrSubset(Subset):
+
+    #def __init__(self, *args, **kwargs):
+    #    super().__init__(*args, **kwargs)
+    #    self.get_label_counts()
+
+    def get_label_counts(self, indices=None):
+        if indices is None:
+            indices = list(range(self.__len__()))
+        df = self.dataset.get_label_counts([self.indices[x] for x in indices])
+        return df
+
+    @property
+    def labels(self):
+        return self.dataset.labels
+
+
+def cxr_random_split(dataset, lengths):
+    from torch._utils import _accumulate
+    if sum(lengths) > len(dataset):
+        raise ValueError("Sum of input lengths must less or equal to the length of the input dataset!")
+    indices = torch.randperm(sum(lengths)).tolist()
+    return [CxrSubset(dataset, indices[offset - length:offset]) for offset, length in zip(_accumulate(lengths), lengths)]
 
 
 def copy_stanford_dataset(src_path):
@@ -168,9 +237,46 @@ def copy_mimic_dataset(src_path):
             #print(f"{ff} -> {t}")
             Path.mkdir(t.parent, parents=True, exist_ok=True)
             resized.save(t, "JPEG")
+        df.rename(columns={"Airspace Opacity": "Lung Opacity"}) # to match stanford's label
         r = m.relative_to(src_path).name
         t = MIMIC_CXR_BASE.joinpath(r).resolve()
         df.to_csv(t, float_format="%.0f", index=False)
+
+
+def copy_nih_dataset(src_path):
+    manifest_file = src_path.joinpath("Data_Entry_2017.csv")
+    print(f">>> processing {manifest_file}...")
+    df = pd.read_csv(str(manifest_file))
+    files_list = {}
+    for f in src_path.rglob("*.png"):
+        files_list[f.name] = f
+    df_tmps = []
+    for i, row in tqdm(df.iterrows(), total=len(df)):
+        f = row["Image Index"]
+        patient = row["Patient ID"]
+        study = row["Follow-up #"]
+        ff = files_list[f]
+        img = Image.open(ff)
+        w, h = img.size
+        rs = (512, int(h/w*512)) if w < h else (int(w/h*512), 512)
+        resized = img.resize(rs, Image.LANCZOS).convert('L')
+        r = ff.relative_to(src_path)
+        t = NIH_CXR_BASE.joinpath(r).resolve()
+        basename, filename = t.parent, t.name
+        t = basename.joinpath(f"patient{patient:05d}", f"study{study:03d}", filename)
+        t = Path(str(t).replace('.png', '.jpg'))
+        #print(f"{ff} -> {t}")
+        Path.mkdir(t.parent, parents=True, exist_ok=True)
+        resized.save(t, "JPEG")
+        df_tmp = pd.DataFrame()
+        df_tmp["path"] = [t.relative_to(NIH_CXR_BASE)]
+        for l in row["Finding Labels"].split('|'):
+            df_tmp[l] = [1]
+        df_tmps.append(df_tmp)
+    df2 = pd.concat(df_tmps, sort=False)
+    r = manifest_file.name
+    t = NIH_CXR_BASE.joinpath(r).resolve()
+    df2.to_csv(t, float_format="%.0f", index=False)
 
 
 if __name__ == "__main__":
@@ -181,10 +287,18 @@ if __name__ == "__main__":
     #from pprint import pprint
     #pprint(entries[:20])
     """
+
     # resize & copy stanford dataset
     src_path = Path("/media/nfs/CXR/Stanford/full_resolution_version/CheXpert-v1.0").resolve()
-    copy_stanford_dataset(src_path)
+    if src_path.exists():
+        copy_stanford_dataset(src_path)
 
     # resize & copy mimic dataset
     src_path = Path("/media/mycloud/MIMIC_CXR").resolve()
-    copy_mimic_dataset(src_path)
+    if src_path.exists():
+        copy_mimic_dataset(src_path)
+
+    # resize & copy nih dataset
+    src_path = Path("/mnt/hdd/cxr/nih/original").resolve()
+    if src_path.exists():
+        copy_nih_dataset(src_path)
