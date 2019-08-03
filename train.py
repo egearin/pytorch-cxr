@@ -139,7 +139,7 @@ class Trainer:
             tblog_path = runtime_path.joinpath("tensorboard").resolve()
             tblog_path.mkdir(mode=0o755, parents=True, exist_ok=True)
             self.writer = SummaryWriter(log_dir=str(tblog_path))
-        self.progress = {
+        self.metrics = {
             'loss': [],
             'accuracy': [],
             'auc_score': [],
@@ -219,7 +219,7 @@ class Trainer:
         if not ckpt and self.tensorboard:
             self.writer.add_scalar("loss", ave_loss.value()[0].item(), global_step=epoch)
 
-        self.progress['loss'].append((epoch, ave_loss.value()[0].item()))
+        self.metrics['loss'].append((epoch, ave_loss.value()[0].item()))
         logger.info(f"train epoch {epoch:03d}:  "
                     f"ave loss {ave_loss.value()[0]:.6f}")
 
@@ -269,18 +269,18 @@ class Trainer:
             self.writer.add_scalar(f"{prefix}accuracy", accuracy, global_step=epoch)
             self.writer.add_scalar(f"{prefix}auc_score", ave_auc_score, global_step=epoch)
 
-        self.progress[f'{prefix}accuracy'].append((epoch, accuracy))
-        self.progress[f'{prefix}auc_score'].append((epoch, ave_auc_score))
+        self.metrics[f'{prefix}accuracy'].append((epoch, accuracy))
+        self.metrics[f'{prefix}auc_score'].append((epoch, ave_auc_score))
 
     def load(self):
         filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
         with open(filepath, 'rb') as f:
-            self.progress = pickle.load(f)
+            self.metrics = pickle.load(f)
 
     def save(self):
         filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
         with open(filepath, 'wb') as f:
-            pickle.dump(self.progress, f)
+            pickle.dump(self.metrics, f)
 
 
 # We want to visualize the output of the spatial transformers layer
