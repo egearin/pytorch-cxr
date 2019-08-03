@@ -136,19 +136,35 @@ class Trainer:
         self.runtime_path = runtime_path
         self.tensorboard = tensorboard
         if tensorboard:
-            tblog_path = runtime_path.joinpath("tensorboard").resolve()
+            tblog_path = runtime_path.joinpath(f"tensorboard.{self.env.rank}").resolve()
             tblog_path.mkdir(mode=0o755, parents=True, exist_ok=True)
             self.writer = SummaryWriter(log_dir=str(tblog_path))
-        self.metrics = {
-            'loss': [],
-            'accuracy': [],
-            'auc_score': [],
-        }
+            #self.writer.add_custom_scalars({'Stuff': {
+            #    'Losses': ['MultiLine', ['loss/(one|two)']],
+            #    'Metrics': ['MultiLine', ['metric/(three|four)']],
+            #}})
+
+        self.metrics = {}
 
         train_set_percent = len(self.env.train_loader.sampler) / len(self.env.train_loader.dataset) * 100.
         test_set_percent = len(self.env.test_loader.sampler) / len(self.env.test_loader.dataset) * 100.
         logger.info(f"using {len(self.env.train_loader.sampler)}/{len(self.env.train_loader.dataset)} ({train_set_percent:.1f}%) entries for training")
         logger.info(f"using {len(self.env.test_loader.sampler)}/{len(self.env.test_loader.dataset)} ({test_set_percent:.1f}%) entries for testing")
+
+    def add_metric(self, keystr, point):
+        keys = keystr.split('/')
+
+        def add_key(node, keys, point):
+            if not keys:
+                node.append(point)
+                return
+            if keys[0] in node:
+                add_key(node[keys[0]], keys[1:], point)
+            else:
+                node[keys[0]] = [] if len(keys) == 1 else {}
+                add_key(node[keys[0]], keys[1:], point)
+
+        add_key(self.metrics, keys, point)
 
     def train(self, num_epoch, start_epoch=1):
         if start_epoch > 1:
@@ -216,13 +232,13 @@ class Trainer:
 
             del loss
 
-        if not ckpt and self.tensorboard:
-            self.writer.add_scalar("loss", ave_loss.value()[0].item(), global_step=epoch)
-
-        self.metrics['loss'].append((epoch, ave_loss.value()[0].item()))
         logger.info(f"train epoch {epoch:03d}:  "
-                    f"ave loss {ave_loss.value()[0]:.6f}")
+                    f"ave loss {ave_loss.value()[0].item():.6f}")
 
+        if not ckpt and self.tensorboard:
+            self.writer.add_scalar("total/loss", ave_loss.value()[0].item(), global_step=epoch)
+
+        self.add_metric('total/loss', (epoch, ave_loss.value()[0].item()))
         self.env.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.{self.env.rank}.pth.tar"))
 
     def test(self, epoch, test_loader, prefix=""):
@@ -248,29 +264,40 @@ class Trainer:
                 ys = np.append(ys, target.cpu().numpy(), axis=0)
                 ys_hat = np.append(ys_hat, output.cpu().numpy(), axis=0)
 
+            # accuracy
             threshold = np.zeros(out_dim)
-            t, p = ys.astype(np.int), (ys_hat > threshold).astype(np.int)
-            accuracy = sklm.accuracy_score(t.flatten(), p.flatten(), normalize=True)
+            accuracies = [0.] * out_dim
+            for i, l in enumerate(labels):
+                t, p = ys[:, i].astype(np.int), (ys_hat[:, i] > threshold[i]).astype(np.int)
+                accuracies[i] = sklm.accuracy_score(t.flatten(), p.flatten(), normalize=True)
+            total_accuracy = (np.sum(accuracies) * ys.shape[0]) / ys.size
 
             logger.info(f"val epoch {epoch:03d}:  "
-                        f"{prefix}accuracy {accuracy:.6f} ")
+                        f"{prefix}accuracy {total_accuracy:.6f}")
 
+            # auc score
             auc_scores = sklm.roc_auc_score(ys, ys_hat, average=None)
-            ave_auc_score = np.mean(auc_scores)
+            average_auc_score = np.mean(auc_scores)
 
             p = PrettyTable()
             p.field_names = ["findings", "auc_score"]
             for i in range(out_dim):
                 p.add_row([labels[i], f"{auc_scores[i]:.6f}"])
-            tbl_str = p.get_string(title=f"{prefix}auc scores (average {ave_auc_score:.6f})")
+            tbl_str = p.get_string(title=f"{prefix}auc scores (average {average_auc_score:.6f})")
             logger.info(f"\n{tbl_str}")
 
         if self.tensorboard:
-            self.writer.add_scalar(f"{prefix}accuracy", accuracy, global_step=epoch)
-            self.writer.add_scalar(f"{prefix}auc_score", ave_auc_score, global_step=epoch)
+            self.writer.add_scalar(f"total/{prefix}accuracy", total_accuracy, global_step=epoch)
+            self.writer.add_scalar(f"total/{prefix}average_auc_score", average_auc_score, global_step=epoch)
+            for i, l in enumerate(labels):
+                self.writer.add_scalar(f"{l}/{prefix}accuracy", accuracies[i], global_step=epoch)
+                self.writer.add_scalar(f"{l}/{prefix}auc_score", auc_scores[i], global_step=epoch)
 
-        self.metrics[f'{prefix}accuracy'].append((epoch, accuracy))
-        self.metrics[f'{prefix}auc_score'].append((epoch, ave_auc_score))
+        self.add_metric(f'total/{prefix}accuracy', (epoch, total_accuracy))
+        self.add_metric(f'total/{prefix}auc_score', (epoch, average_auc_score))
+        for i, l in enumerate(labels):
+            self.add_metric(f'{l}/{prefix}accuracy', (epoch, accuracies[i]))
+            self.add_metric(f'{l}/{prefix}auc_score', (epoch, auc_scores[i]))
 
     def load(self):
         filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
