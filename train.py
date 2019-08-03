@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import torchvision
 import torchnet as tnt
+import sklearn.metrics as sklm
 
 from apex import amp
 
@@ -63,8 +64,8 @@ class TrainEnvironment(PredictEnvironment):
 
         concat_set = CxrConcatDataset([stanford_train_set, stanford_test_set, mimic_train_set, mimic_test_set])
 
-        datasets = cxr_random_split(concat_set, [360000, 15000])
-        #datasets = cxr_random_split(concat_set, [40000, 20000])
+        #datasets = cxr_random_split(concat_set, [360000, 15000])
+        datasets = cxr_random_split(concat_set, [400, 200])
         #subset = Subset(concat_set, range(0, 36))
         #datasets = random_split(subset, [len(subset) - 12, 12])
 
@@ -186,7 +187,6 @@ class Trainer:
 
         for batch_idx, (data, target) in t:
             data, target = data.to(self.env.device), target.to(self.env.device)
-
             self.env.optimizer.zero_grad()
             output = self.env.model(data)
             loss = self.env.loss(output, target)
@@ -204,12 +204,11 @@ class Trainer:
             ave_loss.add(loss.item())
 
             if ckpt and progress > ckpt and self.tensorboard:
-                progress += len(data)
                 #logger.info(f"train epoch {epoch:03d}:  "
                 #        f"progress/total {progress:06d}/{len(train_loader.dataset):06d} "
                 #            f"({100. * batch_idx / len(train_loader):6.2f}%)  "
                 #            f"loss {loss.item():.6f}")
-
+                progress += len(data)
                 x = (epoch - 1) + progress / len(train_set)
                 global_step = int(x / ckpt_step)
                 self.writer.add_scalar("loss", loss.item(), global_step=global_step)
@@ -227,57 +226,51 @@ class Trainer:
         self.env.save_model(self.runtime_path.joinpath(f"model_epoch_{epoch:03d}.{self.env.rank}.pth.tar"))
 
     def test(self, epoch, test_loader, prefix=""):
-        test_set = test_loader.dataset
         out_dim = self.env.out_dim
         labels = self.env.labels
-
-        aucs = [tnt.meter.AUCMeter() for i in range(out_dim)]
 
         CxrDataset.eval()
         self.env.model.eval()
         with torch.no_grad():
-            test_loss = 0
-            correct = 0
-
             tqdm_desc = f"{prefix}testing [{self.env.rank}]"
             tqdm_pos = self.env.local_rank
 
             t = tqdm(enumerate(test_loader), total=len(test_loader), desc=tqdm_desc,
                      dynamic_ncols=True, position=tqdm_pos)
 
-            ones = torch.ones((out_dim)).int().to(self.env.device)
-            zeros = torch.zeros((out_dim)).int().to(self.env.device)
+            ys_hat = np.empty(shape=[0, out_dim])
+            ys = np.empty(shape=[0, out_dim])
 
             for batch_idx, (data, target) in t:
                 data, target = data.to(self.env.device), target.to(self.env.device)
                 output = self.env.model(data)
-                for i in range(out_dim):
-                    aucs[i].add(output[:, i], target[:, i])
-                pred = torch.where(output > 0., ones, zeros)
-                correct += pred.eq(target.int()).sum().item()
 
-            #correct /= out_dim
-            total = len(test_loader.sampler) * out_dim
-            percent = 100. * correct / total
-            if self.tensorboard:
-                self.writer.add_scalar(f"{prefix}accuracy", percent, global_step=epoch)
+                ys = np.append(ys, target.cpu().numpy(), axis=0)
+                ys_hat = np.append(ys_hat, output.cpu().numpy(), axis=0)
+
+            threshold = np.zeros(out_dim)
+            t, p = ys.astype(np.int), (ys_hat > threshold).astype(np.int)
+            accuracy = sklm.accuracy_score(t.flatten(), p.flatten(), normalize=True)
 
             logger.info(f"val epoch {epoch:03d}:  "
-                        f"{prefix}accuracy {correct}/{total} "
-                        f"({percent:.2f}%)")
+                        f"{prefix}accuracy {accuracy:.6f} ")
+
+            auc_scores = sklm.roc_auc_score(ys, ys_hat, average=None)
+            ave_auc_score = np.mean(auc_scores)
 
             p = PrettyTable()
-            p.field_names = ["findings", "score"]
+            p.field_names = ["findings", "auc_score"]
             for i in range(out_dim):
-                p.add_row([labels[i], f"{aucs[i].value()[0]:.6f}"])
-            ave_auc = np.mean([k.value()[0] for k in aucs])
-            tbl_str = p.get_string(title=f"{prefix}auc scores (average {ave_auc:.6f})")
-            if self.tensorboard:
-                self.writer.add_scalar(f"{prefix}auc_score", ave_auc, global_step=epoch)
+                p.add_row([labels[i], f"{auc_scores[i]:.6f}"])
+            tbl_str = p.get_string(title=f"{prefix}auc scores (average {ave_auc_score:.6f})")
             logger.info(f"\n{tbl_str}")
 
-        self.progress[f'{prefix}accuracy'].append((epoch, correct / total))
-        self.progress[f'{prefix}auc_score'].append((epoch, ave_auc))
+        if self.tensorboard:
+            self.writer.add_scalar(f"{prefix}accuracy", accuracy, global_step=epoch)
+            self.writer.add_scalar(f"{prefix}auc_score", ave_auc_score, global_step=epoch)
+
+        self.progress[f'{prefix}accuracy'].append((epoch, accuracy))
+        self.progress[f'{prefix}auc_score'].append((epoch, ave_auc_score))
 
     def load(self):
         filepath = self.runtime_path.joinpath(f"train.{self.env.rank}.pkl")
