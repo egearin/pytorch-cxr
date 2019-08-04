@@ -13,5 +13,5 @@ tqdm
 ptable
 pyyaml
 slackclient
-tb-nightly
+tensorboard
 gitpython
