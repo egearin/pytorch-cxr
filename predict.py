@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from dataset import get_study, get_image
