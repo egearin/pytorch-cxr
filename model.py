@@ -86,6 +86,25 @@ class WindowOptimizer(nn.Module):
         x = self.tanh(x)
         return x
 
+class CustomBlock(nn.Module):
+
+    def __init__(self, hidden=512, out_dim=14):
+        super().__init__()
+        self.custom = nn.Sequential(OrderedDict([
+                #('bn0', nn.BatchNorm1d(num_fc_neurons)),
+                ('do0', nn.Dropout(0.5)),
+                ('fc0', nn.Linear(hidden, hidden)),
+                ('rl0', nn.ReLU()),
+                #('bn1', nn.BatchNorm1d(num_fc_neurons)),
+                ('do1', nn.Dropout(0.5)),
+                ('fc1', nn.Linear(hidden, hidden)),
+                ('rl1', nn.ReLU()),
+        ]))
+
+    def forward(self, x):
+        y = self.custom(x)
+        z = x + y
+        return z
 
 class Network(nn.Module):
 
@@ -97,20 +116,20 @@ class Network(nn.Module):
         #self.main = tvm.resnext101_32x8d(pretrained=True)
         #self.main.conv1 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
         #self.main.fc = nn.Linear(self.main.fc.in_features, out_dim)
-        #self.main = tvm.densenet121(pretrained=False, drop_rate=0.5, num_classes=512)
-        self.main = tvm.densenet121(pretrained=False, num_classes=512)
+        num_fc_neurons = 512
+        self.main = tvm.densenet121(pretrained=False, drop_rate=0.5, num_classes=num_fc_neurons)
         self.main.features.conv0 = nn.Conv2d(20, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.mode = mode
+
         self.custom = nn.ModuleList([
             nn.Sequential(OrderedDict([
-                ('bn0', nn.BatchNorm1d(512)),
-                ('fc0', nn.Linear(512, 512)),
-                ('do1', nn.Dropout(0.5)),
-                ('fc1', nn.Linear(512, 512)),
-                ('do2', nn.Dropout(0.5)),
-                ('fc2', nn.Linear(512, 1)),
-            ])) for _ in range(out_dim)
+                ('cb', CustomBlock(hidden=num_fc_neurons)),
+                #('bn2', nn.BatchNorm1d(num_fc_neurons)),
+                ('do', nn.Dropout(0.5)),
+                ('fc', nn.Linear(num_fc_neurons, 1)),
+            ]))
+            for _ in range(out_dim)
         ])
-        self.mode = mode
 
     def to_distributed(self, device):
         #modules = self.main.features.__dict__.get('_modules')
