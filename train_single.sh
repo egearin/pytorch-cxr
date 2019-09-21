@@ -12,3 +12,4 @@ python train.py \
   --cuda 0 \
   --runtime-dir $runtime_dir \
   --tensorboard \
+  --ignore-repo-dirty \

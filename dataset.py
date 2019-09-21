@@ -32,6 +32,7 @@ MAX_CHS = 11
 MEAN = 0.4
 STDEV = 0.2
 
+"""
 cxr_train_transforms = tfms.Compose([
     tfms.ToPILImage(),
     tfms.ColorJitter(),
@@ -44,6 +45,21 @@ cxr_train_transforms = tfms.Compose([
     tfms.Normalize((MEAN,), (STDEV,))
     #tfms.Normalize((0.1307,), (0.3081,))
 ])
+"""
+cxr_train_transforms = tfms.Compose([
+    tfms.ToPILImage(),
+    tfms.RandomAffine((-5, 5), translate=None, scale=None, shear=(0.9, 1.1)),
+    #tfms.RandomRotation((-5, 5), resample=Image.BICUBIC),
+    #tfms.Resize(MIN+10, Image.LANCZOS),
+    #tfms.RandomCrop((MIN, MIN)),
+    #tfms.RandomHorizontalFlip(),
+    #tfms.RandomVerticalFlip(),
+    tfms.RandomResizedCrop((MIN, MIN), scale=(0.5, 0.75), ratio=(0.95, 1.05), interpolation=Image.LANCZOS),
+    tfms.ToTensor(),
+    tfms.Normalize((MEAN,), (STDEV,))
+    #tfms.Normalize((0.1307,), (0.3081,))
+])
+
 
 cxr_test_transforms = tfms.Compose([
     tfms.ToPILImage(),
