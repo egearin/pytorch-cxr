@@ -6,7 +6,12 @@ export NCCL_DEBUG=INFO
 export MASTER_ADDR="127.0.0.1"
 export MASTER_PORT="12345"
 
-runtime_dir="20190919_iid_max_dist_rank3_per_study"
+datamode="iid_max_dist"
+mode="per_study"
+desc="no_positive_weight"
+runtime_dir="20190924_${datamode}_${mode}_${desc}"
+
+rm -rf runtime/$runtime_dir
 
 python -m torch.distributed.launch \
   --nnodes 1 \
@@ -15,7 +20,7 @@ python -m torch.distributed.launch \
   --master_addr $MASTER_ADDR \
   --master_port $MASTER_PORT \
   train.py \
-  --cuda 0 \
+  --cuda 0,1,2 \
   --runtime-dir $runtime_dir \
   --tensorboard \
   --ignore-repo-dirty
