@@ -170,13 +170,10 @@ class DistributedTrainEnvironment(TrainEnvironment):
         #                              sampler=DistributedSampler(self.test_loader.dataset),
         #                              shuffle=False, pin_memory=pin_memory)
 
-        self.model = DistributedDataParallel(self.model, device_ids=[self.device],
-                                             output_device=self.device, find_unused_parameters=True)
-        #self.model.to_distributed(self.device)
+        #self.model = DistributedDataParallel(self.model, device_ids=[self.device],
+        #                                     output_device=self.device, find_unused_parameters=True)
+        self.model.to_distributed(self.device)
 
-        self.positive_weights = torch.FloatTensor(self.get_positive_weights()).to(device)
-        #self.loss = nn.BCEWithLogitsLoss(pos_weight=self.positive_weights, reduction='none')
-        self.loss = nn.BCEWithLogitsLoss(reduction='none')
 
 class Trainer:
 
@@ -497,6 +494,17 @@ def initialize(args):
     return distributed, runtime_path, device
 
 
+def main(args):
+    distributed, runtime_path, device = initialize(args)
+
+    # start training
+    env = DistributedTrainEnvironment(device, args.local_rank, amp_enable=args.amp) if distributed else \
+          TrainEnvironment(device, amp_enable=args.amp)
+
+    t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
+    t.train(args.epoch, start_epoch=args.start_epoch)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -513,12 +521,4 @@ if __name__ == "__main__":
     parser.add_argument('--ignore-repo-dirty', default=False, action='store_true', help="not checking the repo clean")
     args = parser.parse_args()
 
-    distributed, runtime_path, device = initialize(args)
-
-    # start training
-    env = DistributedTrainEnvironment(device, args.local_rank, amp_enable=args.amp) if distributed else \
-          TrainEnvironment(device, amp_enable=args.amp)
-
-    t = Trainer(env, runtime_path=runtime_path, tensorboard=args.tensorboard)
-    t.train(args.epoch, start_epoch=args.start_epoch)
-
+    main(args)
