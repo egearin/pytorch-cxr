@@ -6,9 +6,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from utils import logger, get_devices, print_versions
-from dataset import Mode, STANFORD_CXR_BASE, MIMIC_CXR_BASE, NIH_CXR_BASE, get_study, get_image, cxr_test_transforms
+from dataset import Mode, MIMIC_CXR_BASE, get_study, get_image, cxr_test_transforms
 from model import Network
-#from danet import Network
 
 pd.set_option('mode.chained_assignment', None)
 

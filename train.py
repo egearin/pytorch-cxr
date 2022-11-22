@@ -32,7 +32,7 @@ from apex import amp
 from utils import logger, print_versions, get_devices, get_ip, get_commit
 #from adamw import AdamW
 from predict import PredictEnvironment, Predictor
-from dataset import Mode, StanfordCxrDataset, MitCxrDataset, NihCxrDataset, CxrConcatDataset, CxrSubset, cxr_random_split
+from dataset import Mode, MitCxrDataset, CxrConcatDataset, CxrSubset, cxr_random_split
 
 
 def check_distributed(args):
@@ -54,28 +54,18 @@ class BaseTrainEnvironment(PredictEnvironment):
         self.device = device
 
         CLASSES = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Pleural Effusion']
-        stanford_train_set = StanfordCxrDataset("train.csv", mode=mode, classes=CLASSES)
-        stanford_test_set = StanfordCxrDataset("valid.csv", mode=mode, classes=CLASSES)
-        stanford_set = CxrConcatDataset([stanford_train_set, stanford_test_set])
-
         mimic_train_set = MitCxrDataset("train.csv", mode=mode, classes=CLASSES)
         mimic_test_set = MitCxrDataset("valid.csv", mode=mode, classes=CLASSES)
         mimic_set = CxrConcatDataset([mimic_train_set, mimic_test_set])
 
         CLASSES = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Effusion']
-        nih_set = NihCxrDataset("Data_Entry_2017.csv", mode=mode, classes=CLASSES)
-        nih_set.rename_classes({'Effusion': 'Pleural Effusion'})
 
         if mode == Mode.PER_STUDY:
-            self.stanford_datasets = cxr_random_split(stanford_set, [175000, 10000])
             self.mimic_datasets = cxr_random_split(mimic_set, [200000, 10000])
-            self.nih_datasets = cxr_random_split(nih_set, [100000, 10000])
+            
         else:  # Mode.PER_IMAGE
-            self.stanford_datasets = cxr_random_split(stanford_set, [210000, 10000])
             self.mimic_datasets = cxr_random_split(mimic_set, [360000, 10000])
-            self.nih_datasets = cxr_random_split(nih_set, [100000, 10000])
 
-        self.classes = [x.lower() for x in self.stanford_datasets[0].classes]
         self.out_dim = len(self.classes)
 
         super().__init__(out_dim=self.out_dim, device=self.device, mode=mode)
@@ -92,16 +82,11 @@ class TrainEnvironment(BaseTrainEnvironment):
         self.local_rank = 0
         self.rank = 0
 
-        train_set = CxrConcatDataset([self.stanford_datasets[0], self.mimic_datasets[0], self.nih_datasets[0]])
         #partial_train_set = CxrSubset(train_set, torch.randperm(len(train_set)).tolist()[:10])
-        test_sets = [self.stanford_datasets[1], self.mimic_datasets[1], self.nih_datasets[1]]
-
-        #concat_set = CxrConcatDataset([stanford_train_set, stanford_test_set])
         #datasets = cxr_random_split(concat_set, [300000, 10000])
         #datasets = cxr_random_split(concat_set, [400, 200])
         #subset = Subset(concat_set, range(0, 36))
         #datasets = random_split(subset, [len(subset) - 12, 12])
-        #datasets = [stanford_train_set, stanford_test_set]
 
         pin_memory = True if self.device.type == 'cuda' else False
         self.train_loader = DataLoader(train_set, batch_size=24, num_workers=4, shuffle=True, pin_memory=pin_memory)

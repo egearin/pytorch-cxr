@@ -3,7 +3,7 @@
 #git+http://github.com/pytorch/vision.git
 #git+http://github.com/pytorch/audio.git
 #git+http://github.com/pytorch/text.git
-git+http://github.com/pytorch/tnt.git
+#git+http://github.com/pytorch/tnt.git
 git+http://github.com/nvidia/apex.git
 future
 imageio
